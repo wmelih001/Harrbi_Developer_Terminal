@@ -24,9 +24,10 @@ func NewScanner(cfg *domain.Config) *Scanner {
 
 // packageJSON minimal struct for parsing
 type packageJSON struct {
-	Dependencies    map[string]string `json:"dependencies"`
-	DevDependencies map[string]string `json:"devDependencies"`
-	Scripts         map[string]string `json:"scripts"`
+	Dependencies         map[string]string `json:"dependencies"`
+	DevDependencies      map[string]string `json:"devDependencies"`
+	OptionalDependencies map[string]string `json:"optionalDependencies"`
+	Scripts              map[string]string `json:"scripts"`
 }
 
 // composerJSON for PHP projects
@@ -44,14 +45,17 @@ type TechSignature struct {
 
 // ProjectCache cache yapısı
 type ProjectCache struct {
+	Version      int              `json:"version"` // Cache versiyonu (yapısal değişiklikler için)
 	Projects     []domain.Project `json:"projects"`
 	Timestamp    int64            `json:"timestamp"`
 	RootPath     string           `json:"root_path"`
 	RootModTimes map[string]int64 `json:"root_mod_times"`
 }
 
-// TODO: Cache dosya yolu dinamik olmalı (örn: user home altında)
-const cacheFileName = ".devterminal_cache.json"
+const (
+	CurrentCacheVersion = 4 // Versiyon 4: Monorepo root script önceliği eklendi
+	cacheFileName       = ".devterminal_cache.json"
+)
 
 // loadCache cache'den projeleri yükler
 func (s *Scanner) loadCache(rootPath string) ([]domain.Project, bool) {
@@ -69,6 +73,11 @@ func (s *Scanner) loadCache(rootPath string) ([]domain.Project, bool) {
 	var cache ProjectCache
 	if err := json.Unmarshal(data, &cache); err != nil {
 		return nil, false
+	}
+
+	// Versiyon kontrolü
+	if cache.Version != CurrentCacheVersion {
+		return nil, false // Versiyon değişmiş, yeniden tara
 	}
 
 	// Root path (bileşimi) değiştiyse cache geçersiz
@@ -120,6 +129,7 @@ func (s *Scanner) saveCache(rootPath string, projects []domain.Project) {
 	}
 
 	cache := ProjectCache{
+		Version:      CurrentCacheVersion,
 		Projects:     projects,
 		Timestamp:    time.Now().Unix(),
 		RootPath:     rootPath,
@@ -858,42 +868,88 @@ func (s *Scanner) scanMonorepo(projectPath string, p *domain.Project) {
 					continue
 				}
 
-				// Frontend kontrolü
-				for _, sig := range frontendSigs {
-					if found, ver := sig.CheckFunc(subPath); found {
-						subProject := domain.SubProject{
-							Name:       subName,
-							Path:       subPath,
-							Type:       sig.Type,
-							Version:    ver,
-							StartCmd:   s.detectStartCommand(subPath, true, false),
-							IsFrontend: true,
+				isFrontendHint := isFrontendFolderName(subName)
+				isBackendHint := isBackendFolderName(subName)
+
+				// Backend ipucu varsa frontend imzalarıyla karıştırma.
+				if isBackendHint {
+					foundBackend := false
+					for _, sig := range backendSigs {
+						if found, ver := sig.CheckFunc(subPath); found {
+							subProject := domain.SubProject{
+								Name:       subName,
+								Path:       subPath,
+								Type:       sig.Type,
+								Version:    nonEmptyVersion(ver),
+								StartCmd:   s.detectStartCommand(subPath, false, true),
+								IsFrontend: false,
+							}
+							s.applyMonorepoRootScript(projectPath, &subProject)
+							p.AllBackends = append(p.AllBackends, subProject)
+							foundBackend = true
+							break
 						}
-						if subProject.Version == "" {
-							subProject.Version = "Var"
-						}
-						p.AllFrontends = append(p.AllFrontends, subProject)
-						break
 					}
+					if !foundBackend {
+						if _, err := os.Stat(filepath.Join(subPath, "package.json")); err == nil {
+							subProject := domain.SubProject{
+								Name:       subName,
+								Path:       subPath,
+								Type:       domain.TypeUnknown,
+								Version:    "Var",
+								StartCmd:   s.detectStartCommand(subPath, false, true),
+								IsFrontend: false,
+							}
+							s.applyMonorepoRootScript(projectPath, &subProject)
+							p.AllBackends = append(p.AllBackends, subProject)
+						}
+					}
+					continue
 				}
 
-				// Backend kontrolü
-				for _, sig := range backendSigs {
-					if found, ver := sig.CheckFunc(subPath); found {
-						subProject := domain.SubProject{
-							Name:       subName,
-							Path:       subPath,
-							Type:       sig.Type,
-							Version:    ver,
-							StartCmd:   s.detectStartCommand(subPath, false, true),
-							IsFrontend: false,
+				// Frontend ipucu varsa backend imzalarıyla karıştırma.
+				if isFrontendHint {
+					foundFrontend := false
+					for _, sig := range frontendSigs {
+						if found, ver := sig.CheckFunc(subPath); found {
+							subProject := domain.SubProject{
+								Name:       subName,
+								Path:       subPath,
+								Type:       sig.Type,
+								Version:    nonEmptyVersion(ver),
+								StartCmd:   s.detectStartCommand(subPath, true, false),
+								IsFrontend: true,
+							}
+							s.applyMonorepoRootScript(projectPath, &subProject)
+							p.AllFrontends = append(p.AllFrontends, subProject)
+							foundFrontend = true
+							break
 						}
-						if subProject.Version == "" {
-							subProject.Version = "Var"
-						}
-						p.AllBackends = append(p.AllBackends, subProject)
-						break
 					}
+					if !foundFrontend {
+						if _, err := os.Stat(filepath.Join(subPath, "package.json")); err == nil {
+							subProject := domain.SubProject{
+								Name:       subName,
+								Path:       subPath,
+								Type:       domain.TypeUnknown,
+								Version:    "Var",
+								StartCmd:   s.detectStartCommand(subPath, true, false),
+								IsFrontend: true,
+							}
+							s.applyMonorepoRootScript(projectPath, &subProject)
+							p.AllFrontends = append(p.AllFrontends, subProject)
+						}
+					}
+					continue
+				}
+
+				if subProject, ok := s.detectMonorepoSubProject(subName, subPath, frontendSigs, true); ok {
+					s.applyMonorepoRootScript(projectPath, &subProject)
+					p.AllFrontends = append(p.AllFrontends, subProject)
+				}
+				if subProject, ok := s.detectMonorepoSubProject(subName, subPath, backendSigs, false); ok {
+					s.applyMonorepoRootScript(projectPath, &subProject)
+					p.AllBackends = append(p.AllBackends, subProject)
 				}
 			}
 		}
@@ -921,6 +977,137 @@ func (s *Scanner) scanMonorepo(projectPath string, p *domain.Project) {
 			p.BackendCmd = first.StartCmd
 		}
 	}
+}
+
+func (s *Scanner) detectMonorepoSubProject(subName, subPath string, sigs []TechSignature, isFrontend bool) (domain.SubProject, bool) {
+	for _, sig := range sigs {
+		if found, ver := sig.CheckFunc(subPath); found {
+			return domain.SubProject{
+				Name:       subName,
+				Path:       subPath,
+				Type:       sig.Type,
+				Version:    nonEmptyVersion(ver),
+				StartCmd:   s.detectStartCommand(subPath, isFrontend, !isFrontend),
+				IsFrontend: isFrontend,
+			}, true
+		}
+	}
+	return domain.SubProject{}, false
+}
+
+func (s *Scanner) applyMonorepoRootScript(rootPath string, subProject *domain.SubProject) {
+	scriptName := s.findMonorepoRootScript(rootPath, subProject.Name, subProject.IsFrontend)
+	if scriptName == "" {
+		return
+	}
+	subProject.Path = rootPath
+	subProject.StartCmd = packageManagerRunScriptCommand(rootPath, scriptName)
+}
+
+func (s *Scanner) findMonorepoRootScript(rootPath, subName string, isFrontend bool) string {
+	data, err := os.ReadFile(filepath.Join(rootPath, "package.json"))
+	if err != nil {
+		return ""
+	}
+
+	var pkg packageJSON
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return ""
+	}
+	if len(pkg.Scripts) == 0 {
+		return ""
+	}
+
+	name := strings.ToLower(subName)
+	roleNames := []string{name}
+	if isFrontend {
+		roleNames = append(roleNames, "web", "client", "frontend")
+	} else {
+		roleNames = append(roleNames, "api", "server", "backend")
+	}
+
+	for _, candidate := range monorepoRootScriptCandidates(roleNames) {
+		if _, ok := pkg.Scripts[candidate]; ok {
+			return candidate
+		}
+	}
+
+	bestScript := ""
+	bestScore := 0
+	for scriptName, scriptCmd := range pkg.Scripts {
+		score := scoreMonorepoRootScript(scriptName, scriptCmd, name, roleNames)
+		if score > bestScore {
+			bestScore = score
+			bestScript = scriptName
+		}
+	}
+	if bestScore >= 100 {
+		return bestScript
+	}
+	return ""
+}
+
+func monorepoRootScriptCandidates(roleNames []string) []string {
+	seen := make(map[string]bool)
+	var candidates []string
+	add := func(scriptName string) {
+		if !seen[scriptName] {
+			seen[scriptName] = true
+			candidates = append(candidates, scriptName)
+		}
+	}
+	for _, name := range roleNames {
+		add("dev:" + name)
+		add(name + ":dev")
+		add("start:" + name)
+		add(name + ":start")
+		add(name)
+	}
+	return candidates
+}
+
+func scoreMonorepoRootScript(scriptName, scriptCmd, subName string, roleNames []string) int {
+	lowerName := strings.ToLower(scriptName)
+	lowerCmd := strings.ToLower(scriptCmd)
+	score := 0
+
+	if strings.Contains(lowerName, "test") ||
+		strings.Contains(lowerName, "lint") ||
+		strings.Contains(lowerName, "build") ||
+		strings.Contains(lowerName, "typecheck") ||
+		strings.Contains(lowerName, "type-check") ||
+		strings.Contains(lowerName, "verify") {
+		score -= 500
+	}
+
+	if lowerName == "dev:"+subName || lowerName == subName+":dev" {
+		score += 300
+	}
+	for _, roleName := range roleNames {
+		if lowerName == "dev:"+roleName || lowerName == roleName+":dev" {
+			score += 220
+		}
+		if strings.Contains(lowerName, roleName) && strings.Contains(lowerName, "dev") {
+			score += 140
+		}
+		if strings.Contains(lowerCmd, "apps/"+roleName+"/") ||
+			strings.Contains(lowerCmd, "apps\\"+roleName+"\\") ||
+			strings.Contains(lowerCmd, "apps/"+roleName+" ") ||
+			strings.Contains(lowerCmd, "apps\\"+roleName+" ") {
+			score += 160
+		}
+	}
+	if strings.Contains(lowerName, "dev") {
+		score += 40
+	}
+	return score
+}
+
+func nonEmptyVersion(version string) string {
+	if version == "" {
+		return "Var"
+	}
+	return version
 }
 
 func (s *Scanner) ScanProjects() []domain.Project {
@@ -1028,7 +1215,31 @@ func (s *Scanner) getFrontendSignatures() []TechSignature {
 			ver := s.getPackageVersion(path, "react-native")
 			return ver != "", ver
 		}},
-		// Mobile (Native - Android/iOS folders)
+		// Flutter
+		{Type: domain.TypeFlutter, IsFrontend: true, CheckFunc: func(path string) (bool, string) {
+			if _, err := os.Stat(filepath.Join(path, "pubspec.yaml")); err == nil {
+				androidPath := filepath.Join(path, "android")
+				iosPath := filepath.Join(path, "ios")
+				hasAndroid := false
+				hasIOS := false
+				if info, err := os.Stat(androidPath); err == nil && info.IsDir() {
+					hasAndroid = true
+				}
+				if info, err := os.Stat(iosPath); err == nil && info.IsDir() {
+					hasIOS = true
+				}
+				if hasAndroid && hasIOS {
+					return true, "iOS & Android"
+				} else if hasAndroid {
+					return true, "Android"
+				} else if hasIOS {
+					return true, "iOS"
+				}
+				return true, "Var"
+			}
+			return false, ""
+		}},
+		// Mobile (Native - Generic Fallback)
 		{Type: domain.TypeMobile, IsFrontend: true, CheckFunc: func(path string) (bool, string) {
 			androidPath := filepath.Join(path, "android")
 			iosPath := filepath.Join(path, "ios")
@@ -1040,6 +1251,8 @@ func (s *Scanner) getFrontendSignatures() []TechSignature {
 			if info, err := os.Stat(iosPath); err == nil && info.IsDir() {
 				hasIOS = true
 			}
+			// Only valid if it's NOT a web project (to avoid false positives in some hybrid structures)
+			// But for now, since we reordered checks, this should catch only true native apps
 			if hasAndroid && hasIOS {
 				return true, "iOS & Android"
 			} else if hasAndroid {
@@ -1079,13 +1292,8 @@ func (s *Scanner) getFrontendSignatures() []TechSignature {
 			ver := s.getPackageVersion(path, "nuxt")
 			return ver != "", ver
 		}},
-		// Flutter
-		{Type: domain.TypeFlutter, IsFrontend: true, CheckFunc: func(path string) (bool, string) {
-			if _, err := os.Stat(filepath.Join(path, "pubspec.yaml")); err == nil {
-				return true, "Var"
-			}
-			return false, ""
-		}},
+		// Flutter signatures moved up
+
 		// Expo
 		{Type: domain.TypeExpo, IsFrontend: true, CheckFunc: func(path string) (bool, string) {
 			ver := s.getPackageVersion(path, "expo")
@@ -1626,20 +1834,24 @@ func (s *Scanner) getPackageVersion(path, pkgName string) string {
 
 // detectPackageManager projenin kullandığı paket yöneticisini tespit eder
 func (s *Scanner) detectPackageManager(path string) string {
-	if _, err := os.Stat(filepath.Join(path, "bun.lockb")); err == nil {
-		return "bun"
-	}
-	if _, err := os.Stat(filepath.Join(path, "pnpm-lock.yaml")); err == nil {
-		return "pnpm"
-	}
-	if _, err := os.Stat(filepath.Join(path, "yarn.lock")); err == nil {
-		return "yarn"
-	}
-	return "npm"
+	return detectPackageManagerName(path)
 }
 
 // detectStartCommand determines the best command to start the project
 func (s *Scanner) detectStartCommand(path string, isFrontend, isBackend bool) string {
+	// 0. Special Types (Flutter, Mobile, etc.)
+	if _, err := os.Stat(filepath.Join(path, "pubspec.yaml")); err == nil {
+		// Flutter project
+		return "flutter run"
+	}
+	// React Native (often has index.js or App.tsx at root/src but package.json handles it usually)
+	// But if we want to force specific RN commands:
+	if _, err := os.Stat(filepath.Join(path, "node_modules", "react-native")); err == nil {
+		// It's a React Native project.
+		// Prefer "npm start" (Metro bundler) or platform specific
+		// Let the standard package.json parser below decide, usually "start" is present.
+	}
+
 	// 1. JS/TS Projects (Next, Nest, React, Vue, etc.)
 	pkgPath := filepath.Join(path, "package.json")
 	if _, err := os.Stat(pkgPath); err == nil {
@@ -1647,12 +1859,6 @@ func (s *Scanner) detectStartCommand(path string, isFrontend, isBackend bool) st
 		if err == nil {
 			var pkg packageJSON
 			if err := json.Unmarshal(data, &pkg); err == nil {
-				pm := s.detectPackageManager(path)
-				runCmd := pm + " run"
-				if pm == "bun" {
-					runCmd = "bun run"
-				}
-
 				// Akıllı Script Analizi (Score-Based)
 				bestScript := ""
 				maxScore := -9999
@@ -1751,11 +1957,7 @@ func (s *Scanner) detectStartCommand(path string, isFrontend, isBackend bool) st
 				}
 
 				if bestScript != "" && maxScore > 0 {
-					// "npm start" özel durumu
-					if bestScript == "start" && pm == "npm" {
-						return "npm start"
-					}
-					return fmt.Sprintf("%s %s", runCmd, bestScript)
+					return packageManagerRunScriptCommand(path, bestScript)
 				}
 			}
 		}
@@ -1780,7 +1982,41 @@ func (s *Scanner) detectStartCommand(path string, isFrontend, isBackend bool) st
 		return "python main.py"
 	}
 	if _, err := os.Stat(filepath.Join(path, "app.py")); err == nil {
+		// Check for Uvicorn/FastAPI in this file or deps
+		reqPath := filepath.Join(path, "requirements.txt")
+		isFastAPI := false
+		if data, err := os.ReadFile(reqPath); err == nil {
+			content := strings.ToLower(string(data))
+			if strings.Contains(content, "uvicorn") || strings.Contains(content, "fastapi") {
+				isFastAPI = true
+			}
+		}
+
+		if isFastAPI {
+			return "uvicorn app:app --host 0.0.0.0 --port 8000 --reload"
+		}
 		return "python app.py" // Flask
+	}
+
+	// 3.5 Python FastAPI (main.py case)
+	if _, err := os.Stat(filepath.Join(path, "main.py")); err == nil {
+		reqPath := filepath.Join(path, "requirements.txt")
+		if data, err := os.ReadFile(reqPath); err == nil {
+			content := strings.ToLower(string(data))
+			if strings.Contains(content, "uvicorn") || strings.Contains(content, "fastapi") {
+				// Genellikle app.main:app veya main:app olur
+				// Eğer main.py içinde "app =" varsa "main:app"
+				if mainData, err := os.ReadFile(filepath.Join(path, "main.py")); err == nil {
+					if strings.Contains(string(mainData), "app =") {
+						return "uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+					}
+				}
+				// Belki app klasörü içindedir
+				if _, err := os.Stat(filepath.Join(path, "app", "main.py")); err == nil {
+					return "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+				}
+			}
+		}
 	}
 
 	// 4. PHP/Laravel
@@ -1823,12 +2059,30 @@ func (s *Scanner) syncProjectsWithConfig(projects []domain.Project) bool {
 
 	for i := range projects {
 		p := &projects[i]
+		p.FrontendCmd = normalizePackageManagerCommand(p.FrontendCmd)
+		p.BackendCmd = normalizePackageManagerCommand(p.BackendCmd)
 		// Key'i her zaman normalize et (küçük harf)
 		key := strings.ToLower(p.Path)
 
 		override, exists := s.Config.ProjectOverrides[key]
+		changed := false
 
 		if exists {
+			normalizedFrontend := normalizePackageManagerCommand(override.Frontend)
+			if normalizedFrontend != override.Frontend {
+				override.Frontend = normalizedFrontend
+				changed = true
+			}
+			normalizedBackend := normalizePackageManagerCommand(override.Backend)
+			if normalizedBackend != override.Backend {
+				override.Backend = normalizedBackend
+				changed = true
+			}
+			if shouldRepairBackendOverride(*p, override.Backend) {
+				override.Backend = p.BackendCmd
+				changed = true
+			}
+
 			// Override varsa uygula
 			if override.Frontend != "" {
 				p.FrontendCmd = override.Frontend
@@ -1838,7 +2092,6 @@ func (s *Scanner) syncProjectsWithConfig(projects []domain.Project) bool {
 			}
 
 			// Eksik alanları tamamla (Config dosyasını zenginleştir)
-			changed := false
 			if override.Frontend == "" && p.FrontendCmd != "" {
 				override.Frontend = p.FrontendCmd
 				changed = true
@@ -1865,6 +2118,34 @@ func (s *Scanner) syncProjectsWithConfig(projects []domain.Project) bool {
 	}
 
 	return modified
+}
+
+func shouldRepairBackendOverride(p domain.Project, backendOverride string) bool {
+	if !p.IsMonorepo || backendOverride == "" || p.BackendCmd == "" {
+		return false
+	}
+	if normalizePackageManagerCommand(backendOverride) == normalizePackageManagerCommand(p.BackendCmd) {
+		return false
+	}
+	overrideScript := packageManagerScriptName(backendOverride)
+	detectedScript := packageManagerScriptName(p.BackendCmd)
+	if overrideScript != "dev" || detectedScript == "" {
+		return false
+	}
+	return isBackendRoleScript(detectedScript)
+}
+
+func isBackendRoleScript(scriptName string) bool {
+	name := strings.ToLower(scriptName)
+	return name == "dev:api" ||
+		name == "api:dev" ||
+		name == "dev:server" ||
+		name == "server:dev" ||
+		name == "dev:backend" ||
+		name == "backend:dev" ||
+		(strings.Contains(name, "api") && strings.Contains(name, "dev")) ||
+		(strings.Contains(name, "server") && strings.Contains(name, "dev")) ||
+		(strings.Contains(name, "backend") && strings.Contains(name, "dev"))
 }
 
 // checkTools checks for various tools (Prisma, Drizzle, Hasura, Supabase, Storybook)

@@ -13,9 +13,11 @@ import (
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -36,6 +38,7 @@ const (
 	StateHealthScore
 	StateTaskRunner
 	StateSplash
+	StateUpdateFeedback
 )
 
 type NgrokStep int
@@ -67,6 +70,17 @@ type MainModel struct {
 	Spinner        spinner.Model
 	FirstRunInput  textinput.Model
 
+	// Update Feedback Components
+	UpdateProgress   progress.Model
+	UpdateViewport   viewport.Model
+	UpdateLogs       []string
+	UpdateCommands   []*exec.Cmd
+	UpdateCurrentCmd int
+	UpdatePkgs       []string
+	UpdateDone       bool
+	UpdateHasError   bool
+	UpdateVersions   map[string]UpdateVersionInfo
+
 	// Ngrok
 	NgrokService    *service.NgrokService
 	HealthService   *service.HealthService
@@ -96,16 +110,58 @@ type MainModel struct {
 	// Health Score
 	HealthReport *service.HealthReport
 
+	// Doctor State
+	IsUpdatingDependencies bool // Güncelleme işlemi sürüyor mu? (Legacy flag, maybe unused in new state)
+
 	// Splash
 	SplashProgress float64
 }
 
+type UpdateVersionInfo struct {
+	From string
+	To   string
+}
+
+// Custom Messages
 type splashTickMsg time.Time
+type packageUpdateCompleteMsg struct{}
 
 type copiedResetMsg struct{}
+type updateLogMsg string
+type updateCmdFinishedMsg struct {
+	output string
+	err    error
+}
+
+// Async Update Preparation
+type updatePrepMsg struct {
+	cmds     []*exec.Cmd
+	pkgs     []string
+	versions map[string]UpdateVersionInfo
+	err      error
+}
+
+// Simulated Progress Ticker
+type progressTickMsg time.Time
+
+// NOTE: Since full streaming is complex to implement inline without `Program` ref,
+// I will simulate the "Downloading..." phases visually in the View using the Spinner
+// and show the final logs.
+// However, I CAN output logs if I use a channel.
+// Let's stick to the simpler `CombinedOutput` for now but enable the UI *view* to show the pending packages.
+// The user will see "Updating X, Y, Z..." and a spinner.
+// When finished, they get the result.
+// "Gelişmiş" ui request implies visual richness. The Spinner + Checklist is rich.
+// Real-time progress bar for `pub add` is overkill/impossible without pipe.
+// I will stick to: List packages. Show "Pending" -> "Done".
+// It's effectively batch, so all go "Done" at once.
+// I'll assume this is acceptable if the UI is pretty.
+//
+// WAIT. The user said "alt alta sıralansın".
+// I'll list them.
 
 func NewMainModel() *MainModel {
-	cfg, err := config.LoadConfig() // Should inject this properly in main
+	cfg, err := config.LoadConfig()
 	if err != nil {
 		// handle fatal error or use empty config
 		cfg = &domain.Config{}
@@ -113,7 +169,7 @@ func NewMainModel() *MainModel {
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = TitleStyle // Reuse style
+	// s.Style removed to prevent alignment issues
 
 	tiPort := textinput.New()
 	tiPort.Placeholder = "3000"
@@ -162,6 +218,7 @@ func NewMainModel() *MainModel {
 		List:            list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
 		TaskRunnerList:  list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
 		Table:           newTable(),
+		UpdateViewport:  viewport.New(100, 10), // Default size, key to resize later
 	}
 }
 
@@ -273,12 +330,89 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case StateDependencyDoctor:
-			if msg.String() == "esc" {
-				m.State = StateProjectActions
+			// Eğer güncelleme sürüyorsa sadece Q ve Spinner'a izin ver
+			if m.IsUpdatingDependencies {
+				if msg.String() == "q" {
+					return m, tea.Quit
+				}
+				// Spinner update already handled in global switch below (or above)?
+				// Actually we need to explicitly handle spinner update here or ensure it falls through.
+				// In the current structure, spinner is updated in the "Alt bileşenleri güncelle" section.
+				// So we just return here to block other inputs.
 				return m, nil
 			}
-			if msg.String() == "q" {
+
+			// Tablo navigasyonu için event'i tabloya ilet
+			m.Table, cmd = m.Table.Update(msg)
+			cmds = append(cmds, cmd)
+
+			switch msg.String() {
+			case "esc":
+				m.State = StateProjectActions
+				m.Err = nil
+				return m, nil
+			case "q":
 				return m, tea.Quit
+			case "f":
+				// Update ALL packages (only those not up-to-date)
+				var pkgsToUpdate []string
+				var versionsToUpdate = make(map[string]UpdateVersionInfo)
+
+				rows := m.Table.Rows()
+				for _, row := range rows {
+					if len(row) > 3 {
+						// row[1] = Current, row[3] = Latest (display)
+						// If row[3] is "latest", it means up to date.
+						// Also check if they are equal string wise just in case.
+						if row[3] != "latest" && row[1] != row[3] && row[1] != "?" {
+							pkgsToUpdate = append(pkgsToUpdate, row[0])
+							versionsToUpdate[row[0]] = UpdateVersionInfo{From: row[1], To: row[3]}
+						}
+					}
+				}
+
+				if len(pkgsToUpdate) == 0 {
+					return m, nil // Nothing to update
+				}
+
+				// Switch to Spinner immediately
+				m.IsUpdatingDependencies = true
+				// Async preparation
+				return m, tea.Batch(m.Spinner.Tick, m.prepareUpdateCmd(m.Selected, pkgsToUpdate, versionsToUpdate))
+
+			case "enter":
+				// Update SELECTED package
+				if len(m.Table.Rows()) > 0 {
+					row := m.Table.SelectedRow()
+					if len(row) > 3 {
+						// Check if already latest
+						if row[3] == "latest" || row[1] == row[3] {
+							return m, nil // Already up to date
+						}
+
+						pkgName := row[0]
+						versionsToUpdate := make(map[string]UpdateVersionInfo)
+						versionsToUpdate[pkgName] = UpdateVersionInfo{From: row[1], To: row[3]}
+
+						m.IsUpdatingDependencies = true
+						return m, tea.Batch(m.Spinner.Tick, m.prepareUpdateCmd(m.Selected, []string{pkgName}, versionsToUpdate))
+					}
+				}
+			}
+
+		case StateUpdateFeedback:
+			if m.UpdateDone {
+				switch msg.String() {
+				case "esc", "enter", "q":
+					// Return to Doctor and Refresh
+					m.State = StateDependencyDoctor
+					m.IsUpdatingDependencies = true // Show spinner while re-checking
+					m.UpdateLogs = nil
+					m.UpdateCommands = nil
+					m.UpdatePkgs = nil
+					m.UpdateVersions = nil
+					return m, tea.Batch(m.Spinner.Tick, m.checkDependenciesCmd())
+				}
 			}
 
 		case StateHealthScore:
@@ -845,21 +979,136 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case errMsg:
 		m.Err = error(msg)
-		// Clear any ongoing operations
+		m.IsUpdatingDependencies = false
 
+	case packageUpdateCompleteMsg:
+		m.IsUpdatingDependencies = false
+		return m, m.checkDependenciesCmd()
+
+	case updateCmdFinishedMsg:
+		// Append logs
+		cmdName := "Command"
+		if m.UpdateCurrentCmd < len(m.UpdateCommands) {
+			cmdName = fmt.Sprintf("%v", m.UpdateCommands[m.UpdateCurrentCmd].Args)
+		}
+
+		logEntry := fmt.Sprintf("▶ %s\n%s", cmdName, msg.output)
+		if msg.err != nil {
+			logEntry += fmt.Sprintf("\n❌ Error: %v\n", msg.err)
+			m.UpdateHasError = true
+		}
+		m.UpdateLogs = append(m.UpdateLogs, logEntry)
+
+		content := strings.Join(m.UpdateLogs, "\n----------------\n")
+		m.UpdateViewport.SetContent(content)
+		m.UpdateViewport.GotoBottom()
+
+		m.UpdateCurrentCmd++
+		if m.UpdateCurrentCmd < len(m.UpdateCommands) {
+			// Run next
+			return m, m.runNextUpdateCmd
+		} else {
+			// All done
+			m.UpdateDone = true
+			m.IsUpdatingDependencies = false
+			// Do NOT force 1.0 here, let ticker finish it
+			return m, nil
+		}
+
+	case updatePrepMsg:
+		m.IsUpdatingDependencies = false // Spinner handled by Feedback logic now
+
+		if msg.err != nil {
+			m.Err = msg.err
+			return m, nil
+		}
+
+		// Init StateUpdateFeedback
+		m.UpdateCommands = msg.cmds
+		m.UpdatePkgs = msg.pkgs
+		m.UpdateVersions = msg.versions
+		m.UpdateCurrentCmd = 0
+		m.UpdateLogs = []string{}
+		m.UpdateDone = false
+		m.UpdateHasError = false
+		m.UpdateViewport.SetContent("")
+		// Progress removed
+
+		m.State = StateUpdateFeedback
+		m.Width, m.Height = m.List.Width(), m.List.Height()
+		m.UpdateViewport.Width = m.Width - 10
+		m.UpdateViewport.Height = 10
+
+		// Start command AND spinner
+		return m, tea.Batch(
+			spinner.Tick,
+			m.runNextUpdateCmd,
+		)
+
+	case progressTickMsg:
+		if m.State == StateUpdateFeedback {
+			// If Logic is Done but Animation not:
+			if m.UpdateDone {
+				if m.UpdateProgress.Percent() < 1.0 {
+					// Fast finish (slowed down significantly for visibility)
+					cmds = append(cmds, m.UpdateProgress.SetPercent(m.UpdateProgress.Percent()+0.005))
+					cmds = append(cmds, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg { return progressTickMsg(t) }))
+				}
+				return m, tea.Batch(cmds...)
+			}
+
+			// Logic still running
+			// Simulate progress for current step
+			// If we have N commands, each is 1/N.
+			// Wihtin a step, we go from 0 to 0.9 (keep 0.1 for completion snap)
+
+			stepSize := 1.0 / float64(len(m.UpdateCommands))
+			baseProgress := float64(m.UpdateCurrentCmd) * stepSize
+
+			// Increment loosely based on time or just random small increments?
+			// Let's just increment current percent by small amount up to limit
+			currentPct := m.UpdateProgress.Percent()
+			targetLimit := baseProgress + (stepSize * 0.9)
+
+			if currentPct < targetLimit {
+				newPct := currentPct + 0.01 // Slow increment
+				if newPct > targetLimit {
+					newPct = targetLimit
+				}
+				cmds = append(cmds, m.UpdateProgress.SetPercent(newPct))
+			}
+
+			// Continue ticking
+			cmds = append(cmds, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg { return progressTickMsg(t) }))
+		}
 	case doctorMsg:
+		m.IsUpdatingDependencies = false
 		if len(msg) == 0 {
-			// No outdated packages - keep table empty and set flag
+			// No dependencies found at all
 			m.Table.SetRows([]table.Row{})
 			m.AllPackagesUpToDate = true
 		} else {
-			// Outdated packages exist - populate table
+			// Populate table with ALL packages (sorted)
+			keys := make([]string, 0, len(msg))
+			for k := range msg {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+
 			rows := []table.Row{}
-			for pkg, info := range msg {
-				rows = append(rows, table.Row{pkg, info.Current, info.Wanted, info.Latest})
+			allUpToDate := true
+			for _, k := range keys {
+				info := msg[k]
+				latestDisplay := info.Latest
+				if info.Current == info.Latest {
+					latestDisplay = "latest"
+				} else {
+					allUpToDate = false
+				}
+				rows = append(rows, table.Row{k, info.Current, info.Wanted, latestDisplay})
 			}
 			m.Table.SetRows(rows)
-			m.AllPackagesUpToDate = false
+			m.AllPackagesUpToDate = allUpToDate
 		}
 		m.Err = nil // Clear any previous errors
 		// Tablo güncellendi
@@ -880,10 +1129,18 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt bileşenleri güncelle
+	// Alt bileşenleri güncelle
 	switch m.State {
-	case StateScanning, StateNgrok, StateDependencyDoctor:
-		m.Spinner, cmd = m.Spinner.Update(msg)
-		cmds = append(cmds, cmd)
+	case StateScanning, StateNgrok, StateDependencyDoctor, StateUpdateFeedback:
+		// Spinner Update
+		var sCmd tea.Cmd
+		m.Spinner, sCmd = m.Spinner.Update(msg)
+		cmds = append(cmds, sCmd)
+
+		// Progress Bar Update
+		// Handled via TickMsg mostly, but SetPercent cmd returns a model update too.
+		// No manual calculation here anymore to allow simulation.
+
 	case StateSplash:
 		// No component update needed
 	case StateTaskRunner:
@@ -946,7 +1203,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *MainModel) checkDependenciesCmd() tea.Cmd {
 	return func() tea.Msg {
-		res, err := m.Doctor.CheckDependencies(m.Selected.Path)
+		res, err := m.Doctor.CheckDependencies(m.Selected)
 		if err != nil {
 			return errMsg(err)
 		}
@@ -1015,15 +1272,28 @@ func (m *MainModel) View() string {
 		return lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, box)
 
 	case StateDependencyDoctor:
-		footer := m.renderFooter("Esc", "Geri Dön")
-
-		// Show error if exists
+		// Show error if exists (Higher priority)
 		if m.Err != nil {
+			// Stop loading if error occurred
+			// But wait, m.Err might be from update failure.
+			// We should probably clear IsUpdatingDependencies if error occurs.
+			// For now, let's assume update handler sets Err and clears IsUpdating.
+			// Wait, in my Update logic above, I returned errMsg directly.
+			// I need to handle errMsg to clear the flag!
+
+			footer := m.renderFooter("Esc", "Geri Dön")
 			errorMsg := lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#ff5555")).
 				Render(fmt.Sprintf("\n  ⚠️  Hata: %s", m.Err.Error()))
 			return fmt.Sprintf("\n  %s İçin Doktor Raporu\n%s\n\n  %s", m.Selected.Name, errorMsg, footer)
 		}
+
+		// Update in progress?
+		if m.IsUpdatingDependencies {
+			return fmt.Sprintf("\n\n   %s Paketler güncelleniyor...\n\n   📦 %s için işlem yapılıyor.\n   (Bu işlem internet hızınıza göre zaman alabilir)", m.Spinner.View(), m.Selected.Name)
+		}
+
+		footer := m.renderFooter("Enter", "Seçileni Güncelle", "f", "Tümünü Güncelle", "Esc", "Geri Dön")
 
 		// Show loading or results
 		var tableView string
@@ -1035,7 +1305,7 @@ func (m *MainModel) View() string {
 					Foreground(lipgloss.Color("#50fa7b")).
 					Render("✅ Tüm paketler güncel!")
 			} else {
-				// Still loading
+				// Still loading initial check
 				tableView = "\n  " + m.Spinner.View() + " Paketler kontrol ediliyor..."
 			}
 		} else {
@@ -1043,7 +1313,7 @@ func (m *MainModel) View() string {
 			tableView = "\n" + m.Table.View()
 		}
 
-		return fmt.Sprintf("\n  %s İçin Doktor Raporu%s\n\n  %s", m.Selected.Name, tableView, footer)
+		return fmt.Sprintf("\n  %s İçin Doktor Raporu\n%s\n\n  %s", m.Selected.Name, tableView, footer)
 	case StateNgrok:
 		return m.ngrokView()
 	case StateHealthScore:
@@ -1052,6 +1322,8 @@ func (m *MainModel) View() string {
 		return m.taskRunnerView()
 	case StateSplash:
 		return m.splashView()
+	case StateUpdateFeedback:
+		return m.viewUpdateFeedback()
 	}
 
 	return "Bilinmeyen Durum"
@@ -1106,7 +1378,10 @@ func (m *MainModel) ngrokView() string {
 		// No footer here
 
 	case NgrokModeSelect:
-		// ...
+		content = s + "  Ngrok kurulumu nasıl yapılsın?\n\n" +
+			"  [1] Otomatik İndir (Önerilen)\n" +
+			"  [2] Manuel Yol Göster\n"
+		footer = m.renderFooter("Esc", "İptal")
 
 	case NgrokManualPath:
 		content = s + "  Lütfen 'ngrok.exe' dosyasının tam yolunu girin:\n"
@@ -1243,4 +1518,99 @@ func (m *MainModel) healthScoreView() string {
 	)
 
 	return lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, content)
+}
+
+func (m *MainModel) viewUpdateFeedback() string {
+	// 1. Result Screen (Auto-forwarded)
+	if m.UpdateDone || m.UpdateHasError {
+		borderColor := lipgloss.Color("#50fa7b") // Green
+		title := "✅ GÜNCELLEME TAMAMLANDI"
+		desc := "Tüm paketler başarıyla güncellendi."
+
+		if m.UpdateHasError || m.Err != nil {
+			borderColor = lipgloss.Color("#ff5555") // Red
+			title = "❌ GÜNCELLEME TAMAMLANAMADI"
+
+			// Show specific error if available
+			desc = "Bazı paketler güncellenirken hata oluştu."
+			if m.Err != nil {
+				desc = fmt.Sprintf("Hata: %v\n\nLütfen aşağıdaki çıktıları kontrol edin.", m.Err)
+			} else {
+				desc = "Bilinmeyen bir hata oluştu. Lütfen günlükleri kontrol edin."
+			}
+		}
+
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Align(lipgloss.Center).
+			Render(
+				lipgloss.JoinVertical(lipgloss.Center,
+					lipgloss.NewStyle().Foreground(borderColor).Bold(true).Render(title),
+					"",
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#f8f8f2")).Align(lipgloss.Center).Render(desc),
+					"",
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#6272a4")).Render("[ESC] / [Enter] ile Geri Dön"),
+				),
+			)
+		return lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, box)
+	}
+
+	// 2. Processing Screen (Spinner List)
+	var s string
+	s += "\n  " + lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render("📦 Paketler Güncelleniyor...") + "\n\n"
+
+	if len(m.UpdatePkgs) > 0 {
+		// Define styles
+		pkgStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true).Width(30)
+		spinnerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("208")) // Orange
+		bracketStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")) // Grey
+
+		for _, pkg := range m.UpdatePkgs {
+			spinnerView := m.Spinner.View()
+
+			// Use JoinHorizontal to guarantee single line
+			row := lipgloss.JoinHorizontal(lipgloss.Left,
+				"   ",
+				pkgStyle.Render(pkg),
+				bracketStyle.Render("[ "),
+				spinnerStyle.Render(spinnerView),
+				bracketStyle.Render(" ]"),
+			)
+			s += row + "\n\n"
+		}
+	} else {
+		// Fallback
+		s += fmt.Sprintf("   %s [ %s ]\n", "Tüm paketler...", m.Spinner.View())
+	}
+
+	s += "\n\n"
+
+	return s
+}
+
+func (m *MainModel) runNextUpdateCmd() tea.Msg {
+	if m.UpdateCurrentCmd >= len(m.UpdateCommands) {
+		return nil
+	}
+	cmd := m.UpdateCommands[m.UpdateCurrentCmd]
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Enhance error debugging
+		err = fmt.Errorf("Cmd: %s\nDir: %s\nErr: %v", cmd.String(), cmd.Dir, err)
+	}
+	return updateCmdFinishedMsg{output: string(output), err: err}
+}
+
+func (m *MainModel) prepareUpdateCmd(proj *domain.Project, pkgs []string, versions map[string]UpdateVersionInfo) tea.Cmd {
+	return func() tea.Msg {
+		cmds, finalPkgs, err := m.Doctor.GetUpdateCommands(proj, pkgs)
+		return updatePrepMsg{
+			cmds:     cmds,
+			pkgs:     finalPkgs,
+			versions: versions,
+			err:      err,
+		}
+	}
 }

@@ -3,9 +3,7 @@ package service
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -35,10 +33,24 @@ func (l *Launcher) LaunchProject(p *domain.Project, mode string) error {
 	var cmdTmpl string
 	switch mode {
 	case "frontend":
+		if p.FrontendCmd == "" {
+			return fmt.Errorf("frontend başlatma komutu bulunamadı")
+		}
 		cmdTmpl = l.Config.Commands.LaunchFrontend
 	case "backend":
+		if p.BackendCmd == "" {
+			return fmt.Errorf("backend başlatma komutu bulunamadı")
+		}
 		cmdTmpl = l.Config.Commands.LaunchBackend
 	case "full":
+		// Eğer sadece frontend veya sadece backend varsa, o modu çalıştır
+		if p.HasFrontend && !p.HasBackend {
+			return l.LaunchProject(p, "frontend")
+		}
+		if !p.HasFrontend && p.HasBackend {
+			return l.LaunchProject(p, "backend")
+		}
+		// İkisi de varsa Full şablonu kullan
 		cmdTmpl = l.Config.Commands.LaunchFull
 	default:
 		return fmt.Errorf("unknown mode: %s", mode)
@@ -177,28 +189,14 @@ func (l *Launcher) LaunchScript(p domain.Project, scriptName, scriptCmd string) 
 		actualScriptName = strings.TrimPrefix(scriptName, "server:")
 	}
 
-	pm := l.getPackageManager(workingDir)
-	runCmd := fmt.Sprintf("%s run %s", pm, actualScriptName)
+	pm := detectPackageManagerName(workingDir)
+	runCmd := packageManagerRunScriptCommand(workingDir, actualScriptName)
 
-	// Create title: "npm run dev"
 	title := fmt.Sprintf("%s %s", pm, actualScriptName)
 
 	// Use workingDir instead of p.Path
 	cmdStr := fmt.Sprintf(`wt -w 0 nt --title "%s" -d "%s" cmd /k "%s"`, title, workingDir, runCmd)
 	return l.runCmd(cmdStr)
-}
-
-func (l *Launcher) getPackageManager(path string) string {
-	if _, err := os.Stat(filepath.Join(path, "bun.lockb")); err == nil {
-		return "bun"
-	}
-	if _, err := os.Stat(filepath.Join(path, "pnpm-lock.yaml")); err == nil {
-		return "pnpm"
-	}
-	if _, err := os.Stat(filepath.Join(path, "yarn.lock")); err == nil {
-		return "yarn"
-	}
-	return "npm"
 }
 
 // runCmd helper

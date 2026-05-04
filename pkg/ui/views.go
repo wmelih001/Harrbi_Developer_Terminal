@@ -143,14 +143,8 @@ func (m *MainModel) actionsView() string {
 
 	// Helper: Sürüm numarası mı yoksa sadece "Var" mı kontrol et
 	hasRealVersion := func(ver string) bool {
-		// "Var", "iOS", "Android", "iOS & Android" gibi değerler sürüm değil
-		nonVersionValues := []string{"Var", "iOS", "Android", "iOS & Android"}
-		for _, nv := range nonVersionValues {
-			if ver == nv {
-				return false
-			}
-		}
-		return true
+		// "Var" değeri sürüm değil, diğerleri (örn: "iOS & Android") gösterilmeli
+		return ver != "Var"
 	}
 
 	// Teknolojileri sürümü olanlar ve olmayanlar olarak ayır
