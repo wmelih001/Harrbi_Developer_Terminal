@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,6 +99,10 @@ type MainModel struct {
 	Err    error
 	Width  int
 	Height int
+
+	// Project actions viewport
+	ActionScroll int
+	HealthScroll int
 
 	// Feedback Flags
 	CopiedSuccess       bool
@@ -281,11 +286,30 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.MouseMsg:
-		if m.State == StateProjectActions &&
-			msg.Button == tea.MouseButtonLeft &&
-			msg.Action == tea.MouseActionPress {
-			if action := m.dbToolActionAtY(msg.Y); action != dbToolNone {
-				return m, m.launchDbToolCmd(action)
+		if m.State == StateProjectActions {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.scrollProjectActions(-3)
+				return m, nil
+			case tea.MouseButtonWheelDown:
+				m.scrollProjectActions(3)
+				return m, nil
+			}
+
+			if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+				if action := m.dbToolActionAtY(msg.Y); action != dbToolNone {
+					return m, m.launchDbToolCmd(action)
+				}
+			}
+		}
+		if m.State == StateHealthScore {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.scrollHealthScore(-3)
+				return m, nil
+			case tea.MouseButtonWheelDown:
+				m.scrollHealthScore(3)
+				return m, nil
 			}
 		}
 
@@ -449,6 +473,9 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case StateHealthScore:
+			if m.handleHealthScoreScrollKey(msg.String()) {
+				return m, nil
+			}
 			if msg.String() == "esc" {
 				m.State = StateProjectActions
 				return m, nil
@@ -662,6 +689,9 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if action := dbToolActionForKey(msg.String(), m.Selected); action != dbToolNone {
 				return m, m.launchDbToolCmd(action)
 			}
+			if m.handleProjectActionsScrollKey(msg.String()) {
+				return m, nil
+			}
 
 			switch msg.String() {
 			case "1", "f":
@@ -731,6 +761,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Health Score Trigger
 				report := m.HealthService.CheckProjectHealth(*m.Selected)
 				m.HealthReport = &report
+				m.HealthScroll = 0
 				m.State = StateHealthScore
 				return m, nil
 			case "7", "t":
@@ -813,6 +844,8 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.List.SetHeight(msg.Height - 10)
 		m.TaskRunnerList.SetWidth(msg.Width)
 		m.TaskRunnerList.SetHeight(msg.Height - 5) // Use more space for task runner
+		m.clampProjectActionsScroll()
+		m.clampHealthScoreScroll()
 
 	case projectMsg:
 		m.Projects = msg
@@ -1210,6 +1243,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						cmds = append(cmds, m.Spinner.Tick, m.checkDependenciesCmd())
 					} else {
 						m.State = StateProjectActions // Alt menüye git
+						m.ActionScroll = 0
 					}
 				}
 			}
@@ -1290,6 +1324,124 @@ func (m *MainModel) dependencyTargetLabel() string {
 		return target.Label
 	}
 	return target.Name
+}
+
+func (m *MainModel) handleProjectActionsScrollKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "up", "k":
+		m.scrollProjectActions(-1)
+	case "down", "j":
+		m.scrollProjectActions(1)
+	case "pgup":
+		m.scrollProjectActions(-m.projectActionsVisibleHeight())
+	case "pgdown":
+		m.scrollProjectActions(m.projectActionsVisibleHeight())
+	case "home":
+		m.ActionScroll = 0
+	case "end":
+		m.ActionScroll = m.projectActionsMaxScroll()
+	default:
+		return false
+	}
+	return true
+}
+
+func (m *MainModel) scrollProjectActions(delta int) {
+	m.ActionScroll += delta
+	m.clampProjectActionsScroll()
+}
+
+func (m *MainModel) clampProjectActionsScroll() {
+	maxScroll := m.projectActionsMaxScroll()
+	if m.ActionScroll < 0 {
+		m.ActionScroll = 0
+	}
+	if m.ActionScroll > maxScroll {
+		m.ActionScroll = maxScroll
+	}
+}
+
+func (m *MainModel) projectActionsMaxScroll() int {
+	bodyHeight := m.projectActionsVisibleHeight()
+	if bodyHeight <= 0 || m.Selected == nil {
+		return 0
+	}
+
+	lineCount := len(strings.Split(m.actionsBodyView(), "\n"))
+	if lineCount <= bodyHeight {
+		return 0
+	}
+	return lineCount - bodyHeight
+}
+
+func (m *MainModel) projectActionsVisibleHeight() int {
+	if m.Height <= 0 {
+		return 0
+	}
+	height := m.Height - 1
+	if height < 1 {
+		return 1
+	}
+	return height
+}
+
+func (m *MainModel) handleHealthScoreScrollKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "up", "k":
+		m.scrollHealthScore(-1)
+	case "down", "j":
+		m.scrollHealthScore(1)
+	case "pgup":
+		m.scrollHealthScore(-m.healthScoreVisibleHeight())
+	case "pgdown":
+		m.scrollHealthScore(m.healthScoreVisibleHeight())
+	case "home":
+		m.HealthScroll = 0
+	case "end":
+		m.HealthScroll = m.healthScoreMaxScroll()
+	default:
+		return false
+	}
+	return true
+}
+
+func (m *MainModel) scrollHealthScore(delta int) {
+	m.HealthScroll += delta
+	m.clampHealthScoreScroll()
+}
+
+func (m *MainModel) clampHealthScoreScroll() {
+	maxScroll := m.healthScoreMaxScroll()
+	if m.HealthScroll < 0 {
+		m.HealthScroll = 0
+	}
+	if m.HealthScroll > maxScroll {
+		m.HealthScroll = maxScroll
+	}
+}
+
+func (m *MainModel) healthScoreMaxScroll() int {
+	bodyHeight := m.healthScoreVisibleHeight()
+	if bodyHeight <= 0 || m.HealthReport == nil {
+		return 0
+	}
+
+	lineCount := len(strings.Split(m.healthScoreBodyView(), "\n"))
+	if lineCount <= bodyHeight {
+		return 0
+	}
+	return lineCount - bodyHeight
+}
+
+func (m *MainModel) healthScoreVisibleHeight() int {
+	if m.Height <= 0 {
+		return 0
+	}
+	height := m.Height - 1
+	if height < 1 {
+		return 1
+	}
+	return height
 }
 
 func dbToolActionForKey(key string, project *domain.Project) dbToolAction {
@@ -1654,6 +1806,12 @@ func (m *MainModel) healthScoreView() string {
 		return "Sağlık raporu oluşturulamadı."
 	}
 
+	body := m.healthScoreBodyView()
+	footer := m.renderFooter("↑/↓", "Kaydır", "Esc", "Geri Dön")
+	return m.renderHealthScoreViewport(body, footer)
+}
+
+func (m *MainModel) healthScoreBodyView() string {
 	scoreColor := "#ff5555" // Red
 	if m.HealthReport.Score >= 80 {
 		scoreColor = "#50fa7b" // Green
@@ -1664,7 +1822,7 @@ func (m *MainModel) healthScoreView() string {
 	scoreTitle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(scoreColor)).
 		Bold(true).
-		Render(fmt.Sprintf("%d/100", m.HealthReport.Score))
+		Render(fmt.Sprintf("%d/%d", m.HealthReport.Score, healthMaxScore(m.HealthReport.MaxScore)))
 
 	header := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1673,34 +1831,310 @@ func (m *MainModel) healthScoreView() string {
 		Render(fmt.Sprintf("Proje Sağlık Skoru: %s", scoreTitle))
 
 	var rows []string
+	generalIssues := m.generalHealthIssues()
 
-	// Missing Items
-	if len(m.HealthReport.Issues) > 0 {
-		rows = append(rows, lipgloss.NewStyle().Foreground(lipgloss.Color("#ff5555")).Bold(true).Render("❌ Eksik Öğeler:"))
-		for _, issue := range m.HealthReport.Issues {
-			rows = append(rows, fmt.Sprintf(" • %s (-%d puan)", issue.Description, issue.Points))
-		}
-		rows = append(rows, "")
+	rows = append(rows, lipgloss.NewStyle().Foreground(lipgloss.Color("#bd93f9")).Bold(true).Render("Genel Kontroller"))
+	if len(generalIssues) == 0 && len(m.HealthReport.PassedItems) == 0 {
+		rows = append(rows, "  Kayıtlı genel kontrol yok.")
 	}
-
-	// Passed Items
+	if len(generalIssues) > 0 {
+		rows = append(rows, lipgloss.NewStyle().Foreground(lipgloss.Color("#ff5555")).Bold(true).Render("Eksikler:"))
+		for _, issue := range generalIssues {
+			rows = append(rows, healthIssueLine(issue))
+		}
+	}
 	if len(m.HealthReport.PassedItems) > 0 {
-		rows = append(rows, lipgloss.NewStyle().Foreground(lipgloss.Color("#50fa7b")).Bold(true).Render("✅ Tamamlananlar:"))
+		rows = append(rows, lipgloss.NewStyle().Foreground(lipgloss.Color("#50fa7b")).Bold(true).Render("Tamamlananlar:"))
 		for _, item := range m.HealthReport.PassedItems {
-			rows = append(rows, fmt.Sprintf(" • %s", item))
+			rows = append(rows, healthPassedLine(item))
 		}
 	}
 
-	footer := m.renderFooter("Esc", "Geri Dön")
+	if len(m.HealthReport.ComponentReports) > 0 {
+		rows = append(rows, "", lipgloss.NewStyle().Foreground(lipgloss.Color("#8be9fd")).Bold(true).Render("Bileşen Kontrolleri"))
+		for _, component := range m.HealthReport.ComponentReports {
+			rows = append(rows, healthComponentTitle(component))
+			if len(component.Issues) == 0 && len(component.PassedItems) == 0 {
+				rows = append(rows, "  Kayıtlı bileşen kontrolü yok.")
+				continue
+			}
+			for _, item := range component.PassedItems {
+				rows = append(rows, healthPassedLine(item))
+			}
+			for _, issue := range component.Issues {
+				rows = append(rows, healthIssueLine(issue))
+			}
+		}
+	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		header,
+		m.healthScoreDistributionTable(),
+		"",
 		strings.Join(rows, "\n"),
-		"\n",
-		footer,
 	)
 
-	return lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, content)
+	return lipgloss.NewStyle().PaddingLeft(2).Render("\n" + content + "\n")
+}
+
+func (m *MainModel) renderHealthScoreViewport(content, footer string) string {
+	if m.Height <= 0 {
+		if footer == "" {
+			return content
+		}
+		return content + "\n\n  " + footer
+	}
+
+	m.clampHealthScoreScroll()
+
+	bodyHeight := m.healthScoreVisibleHeight()
+	lines := strings.Split(content, "\n")
+	start := m.HealthScroll
+	if start > len(lines) {
+		start = len(lines)
+	}
+	end := start + bodyHeight
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	visible := strings.Join(lines[start:end], "\n")
+	if h := lipgloss.Height(visible); h < bodyHeight {
+		visible += strings.Repeat("\n", bodyHeight-h)
+	}
+
+	if footer == "" {
+		return visible
+	}
+	return visible + "\n  " + footer
+}
+
+func (m *MainModel) generalHealthIssues() []service.HealthIssue {
+	if m.HealthReport == nil {
+		return nil
+	}
+	if len(m.HealthReport.ComponentReports) == 0 {
+		return m.HealthReport.Issues
+	}
+
+	prefixes := make([]string, 0, len(m.HealthReport.ComponentReports))
+	for _, component := range m.HealthReport.ComponentReports {
+		if component.Name != "" {
+			prefixes = append(prefixes, component.Name+": ")
+		}
+	}
+
+	var issues []service.HealthIssue
+	for _, issue := range m.HealthReport.Issues {
+		if hasAnyPrefix(issue.Description, prefixes) {
+			continue
+		}
+		issues = append(issues, issue)
+	}
+	return issues
+}
+
+type healthScoreDistributionRow struct {
+	Name  string
+	Score int
+	Max   int
+}
+
+func (m *MainModel) healthScoreDistributionTable() string {
+	if m.HealthReport == nil {
+		return ""
+	}
+
+	rows := []healthScoreDistributionRow{
+		{Name: "Proje", Score: m.HealthReport.Score, Max: healthMaxScore(m.HealthReport.MaxScore)},
+	}
+
+	generalPassed := sumHealthPassedPoints(m.HealthReport.PassedItems)
+	generalLost := sumHealthIssuePoints(m.generalHealthIssues())
+	if generalPassed+generalLost > 0 {
+		rows = append(rows, healthScoreDistributionRow{
+			Name:  "Genel",
+			Score: generalPassed,
+			Max:   generalPassed + generalLost,
+		})
+	}
+
+	for _, component := range m.HealthReport.ComponentReports {
+		name := component.Name
+		if name == "" {
+			name = "Bileşen"
+		}
+		name = fmt.Sprintf("%s (%s)", name, healthRoleLabel(component.Role))
+		rows = append(rows, healthScoreDistributionRow{
+			Name:  name,
+			Score: component.Score,
+			Max:   healthMaxScore(component.MaxScore),
+		})
+	}
+
+	const (
+		innerW = 48
+		nameW  = 24
+		scoreW = 10
+		lostW  = 11
+	)
+
+	border := lipgloss.NewStyle().Foreground(ColorGrey)
+	header := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
+
+	top := border.Render("┌" + strings.Repeat("─", innerW) + "┐")
+	sep := border.Render("├" + strings.Repeat("─", innerW) + "┤")
+	bottom := border.Render("└" + strings.Repeat("─", innerW) + "┘")
+	title := healthTableCell(header.Render("Puan Dağılımı"), innerW-2)
+
+	tableRows := []string{
+		top,
+		healthTableRow(border, " "+title+" ", innerW),
+		sep,
+		healthTableRow(border, " "+
+			healthTableCell(header.Render("Alan"), nameW)+
+			healthTableCell(header.Render("Skor"), scoreW)+
+			healthTableCell(header.Render("Kayıp"), lostW), innerW),
+		sep,
+	}
+
+	for _, row := range rows {
+		maxScore := healthMaxScore(row.Max)
+		scoreText := fmt.Sprintf("%d/%d", row.Score, maxScore)
+		lost := maxScore - row.Score
+		if lost < 0 {
+			lost = 0
+		}
+		lostText := fmt.Sprintf("%dp", lost)
+		if lost == 0 {
+			lostText = "Yok"
+		}
+		tableRows = append(tableRows,
+			healthTableRow(border, " "+
+				healthTableCell(fitCell(row.Name, nameW), nameW)+
+				healthTableCell(healthScoreStyle(row.Score, maxScore).Render(scoreText), scoreW)+
+				healthTableCell(healthLostStyle(lost).Render(lostText), lostW), innerW))
+	}
+
+	tableRows = append(tableRows, bottom)
+	return lipgloss.JoinVertical(lipgloss.Left, tableRows...)
+}
+
+func healthTableRow(border lipgloss.Style, content string, width int) string {
+	return border.Render("│") + healthTableCell(content, width) + border.Render("│")
+}
+
+func healthTableCell(content string, width int) string {
+	contentWidth := lipgloss.Width(content)
+	if contentWidth >= width {
+		return content
+	}
+	return content + strings.Repeat(" ", width-contentWidth)
+}
+
+func healthScoreStyle(score, maxScore int) lipgloss.Style {
+	ratio := 0
+	if maxScore > 0 {
+		ratio = score * 100 / maxScore
+	}
+	if ratio >= 80 {
+		return lipgloss.NewStyle().Foreground(ColorGreen)
+	}
+	if ratio >= 50 {
+		return lipgloss.NewStyle().Foreground(ColorYellow)
+	}
+	return lipgloss.NewStyle().Foreground(ColorRed)
+}
+
+func healthLostStyle(lost int) lipgloss.Style {
+	if lost == 0 {
+		return lipgloss.NewStyle().Foreground(ColorGreen)
+	}
+	return lipgloss.NewStyle().Foreground(ColorRed)
+}
+
+func sumHealthIssuePoints(issues []service.HealthIssue) int {
+	total := 0
+	for _, issue := range issues {
+		total += issue.Points
+	}
+	return total
+}
+
+func sumHealthPassedPoints(items []string) int {
+	total := 0
+	for _, item := range items {
+		total += healthPassedItemPoints(item)
+	}
+	return total
+}
+
+func healthPassedItemPoints(item string) int {
+	start := strings.LastIndex(item, "(")
+	end := strings.LastIndex(item, "p)")
+	if start == -1 || end == -1 || end <= start+1 {
+		return 0
+	}
+	points, err := strconv.Atoi(strings.TrimSpace(item[start+1 : end]))
+	if err != nil {
+		return 0
+	}
+	return points
+}
+
+func hasAnyPrefix(text string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func healthComponentTitle(component service.ComponentHealthReport) string {
+	role := healthRoleLabel(component.Role)
+	name := component.Name
+	if name == "" {
+		name = "Bileşen"
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#f8f8f2")).
+		Bold(true).
+		Render(fmt.Sprintf("%s (%s) - %d/%d", name, role, component.Score, healthMaxScore(component.MaxScore)))
+}
+
+func healthMaxScore(maxScore int) int {
+	if maxScore <= 0 {
+		return 100
+	}
+	return maxScore
+}
+
+func healthRoleLabel(role domain.ComponentRole) string {
+	switch role {
+	case domain.ComponentRoleFrontend:
+		return "Frontend"
+	case domain.ComponentRoleBackend:
+		return "Backend"
+	case domain.ComponentRoleTool:
+		return "Araç"
+	case domain.ComponentRoleLibrary:
+		return "Kütüphane"
+	default:
+		return "Bileşen"
+	}
+}
+
+func healthIssueLine(issue service.HealthIssue) string {
+	icon := lipgloss.NewStyle().Foreground(ColorRed).Bold(true).Render("×")
+	text := lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("%s (-%d puan)", issue.Description, issue.Points))
+	return fmt.Sprintf("  %s %s", icon, text)
+}
+
+func healthPassedLine(item string) string {
+	icon := lipgloss.NewStyle().Foreground(ColorGreen).Bold(true).Render("✓")
+	text := lipgloss.NewStyle().Foreground(ColorGreen).Render(item)
+	return fmt.Sprintf("  %s %s", icon, text)
 }
 
 func (m *MainModel) viewUpdateFeedback() string {

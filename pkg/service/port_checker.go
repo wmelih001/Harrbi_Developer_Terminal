@@ -15,6 +15,7 @@ type PortInfo struct {
 	InUse     bool
 	ProcessID int
 	Process   string
+	Label     string
 }
 
 // CommonPorts yaygın geliştirme portları
@@ -192,6 +193,20 @@ func FormatPortWarning(info PortInfo) string {
 		return fmt.Sprintf("⚠️ Port %d kullanımda (%s, PID: %d)", info.Port, info.Process, info.ProcessID)
 	}
 	return fmt.Sprintf("⚠️ Port %d kullanımda", info.Port)
+}
+
+func FormatDependencyPortStatus(info PortInfo) string {
+	label := strings.TrimSpace(info.Label)
+	if label == "" {
+		label = "Docker bağımlılığı"
+	}
+	if info.InUse {
+		if info.Process != "" {
+			return fmt.Sprintf("%s %d hazır (%s, PID: %d)", label, info.Port, info.Process, info.ProcessID)
+		}
+		return fmt.Sprintf("%s %d hazır", label, info.Port)
+	}
+	return fmt.Sprintf("%s %d bekleniyor", label, info.Port)
 }
 
 // KillPort belirtilen portu kullanan işlemi sonlandırmaya çalışır

@@ -17,6 +17,12 @@ var (
 )
 
 func (m *MainModel) actionsView() string {
+	body := m.actionsBodyView()
+	footer := m.renderFooter("↑/↓", "Kaydır", "Esc", "Geri Dön")
+	return m.renderProjectActionsViewport(body, footer)
+}
+
+func (m *MainModel) actionsBodyView() string {
 	p := m.Selected
 
 	// Helper to render checkmark
@@ -277,7 +283,7 @@ func (m *MainModel) actionsView() string {
 
 	// 11. Bottom Border
 	var botBorder string
-	if p.HasDocker || len(monorepoRows) > 0 {
+	if p.HasDocker || len(p.PortWarnings) > 0 || len(monorepoRows) > 0 {
 		botBorder = lipgloss.NewStyle().Foreground(borderColor).Render("└" + strings.Repeat("─", innerW) + "┘")
 	} else {
 		botBorder = lipgloss.NewStyle().Foreground(borderColor).Render("└" + strings.Repeat("─", col1W) + "┴" + strings.Repeat("─", col2W) + "┘")
@@ -316,6 +322,13 @@ func (m *MainModel) actionsView() string {
 	boxParts = append(boxParts, botBorder)
 
 	finalBox := lipgloss.JoinVertical(lipgloss.Left, boxParts...)
+	if dockerTable := m.dockerServicesTable(); dockerTable != "" {
+		if m.Width == 0 || m.Width >= totalWidth+44 {
+			finalBox = lipgloss.JoinHorizontal(lipgloss.Top, finalBox, "  ", dockerTable)
+		} else {
+			finalBox = lipgloss.JoinVertical(lipgloss.Left, finalBox, dockerTable)
+		}
+	}
 
 	// --- SEÇENEKLER ---
 	var b strings.Builder
@@ -382,24 +395,103 @@ func (m *MainModel) actionsView() string {
 	// Apply global left padding to main content
 	content := lipgloss.NewStyle().PaddingLeft(2).Render(b.String())
 
-	// Footer Oluştur
-	footer := m.renderFooter("Esc", "Geri Dön")
+	return content
+}
 
-	// Sticky Footer Logic (En alta it)
-	if footer != "" {
-		hContent := lipgloss.Height(content)
-		hFooter := lipgloss.Height(footer)
-		gap := m.Height - hContent - hFooter - 1 // -1 safety
-		if gap > 0 {
-			content += strings.Repeat("\n", gap)
-		} else {
-			content += "\n\n"
+func (m *MainModel) renderProjectActionsViewport(content, footer string) string {
+	if m.Height <= 0 {
+		if footer == "" {
+			return content
 		}
-		// Footer padding must match content padding (2 spaces)
-		content += "  " + footer
+		return content + "\n\n  " + footer
 	}
 
-	return content
+	m.clampProjectActionsScroll()
+
+	bodyHeight := m.projectActionsVisibleHeight()
+	lines := strings.Split(content, "\n")
+	start := m.ActionScroll
+	if start > len(lines) {
+		start = len(lines)
+	}
+	end := start + bodyHeight
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	visible := strings.Join(lines[start:end], "\n")
+	if h := lipgloss.Height(visible); h < bodyHeight {
+		visible += strings.Repeat("\n", bodyHeight-h)
+	}
+
+	if footer == "" {
+		return visible
+	}
+	return visible + "\n  " + footer
+}
+
+func (m *MainModel) dockerServicesTable() string {
+	p := m.Selected
+	if p == nil || len(p.DockerServices) == 0 {
+		return ""
+	}
+
+	const (
+		innerW  = 40
+		nameW   = 17
+		portW   = 8
+		statusW = 14
+	)
+
+	borderColor := ColorGrey
+	border := lipgloss.NewStyle().Foreground(borderColor)
+	header := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
+	nameCell := lipgloss.NewStyle().Width(nameW)
+	portCell := lipgloss.NewStyle().Width(portW)
+	statusCell := lipgloss.NewStyle().Width(statusW)
+
+	top := border.Render("┌" + strings.Repeat("─", innerW) + "┐")
+	sep := border.Render("├" + strings.Repeat("─", innerW) + "┤")
+	bottom := border.Render("└" + strings.Repeat("─", innerW) + "┘")
+
+	title := lipgloss.NewStyle().Padding(0, 1).Width(innerW).Render(header.Render("Docker Servisleri"))
+	rows := []string{top, border.Render("│") + title + border.Render("│"), sep}
+
+	columns := " " +
+		nameCell.Render("Servis") +
+		portCell.Render("Port") +
+		statusCell.Render("Durum")
+	rows = append(rows, border.Render("│")+header.Render(columns)+border.Render("│"))
+	rows = append(rows, sep)
+
+	for _, service := range p.DockerServices {
+		statusStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+		if service.InUse {
+			statusStyle = lipgloss.NewStyle().Foreground(ColorGreen)
+		}
+		row := " " +
+			nameCell.Render(fitCell(service.Name, nameW)) +
+			portCell.Render(fmt.Sprintf("%d", service.Port)) +
+			statusCell.Render(statusStyle.Render(fitCell(service.Status, statusW)))
+		rows = append(rows, border.Render("│")+row+border.Render("│"))
+	}
+
+	rows = append(rows, bottom)
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+func fitCell(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= width {
+		return text
+	}
+	if width <= 2 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-2]) + ".."
 }
 
 func (m *MainModel) dashboardView() string {
@@ -461,7 +553,7 @@ func (m *MainModel) splashView() string {
 	// Kullanıcı "Havalı koyu bir renk" dedi.
 	styledLogo := lipgloss.NewStyle().Foreground(lipgloss.Color("#bd93f9")).Bold(true).Render(art)
 
-	version := lipgloss.NewStyle().Foreground(lipgloss.Color("#6272a4")).Italic(true).Render("Developer Terminal v1.0.5")
+	version := lipgloss.NewStyle().Foreground(lipgloss.Color("#6272a4")).Italic(true).Render("Developer Terminal v1.1.1")
 
 	// 2. Dynamic Progress Bar
 	width := 40

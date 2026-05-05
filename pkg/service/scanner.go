@@ -55,7 +55,7 @@ type ProjectCache struct {
 }
 
 const (
-	CurrentCacheVersion = 11 // Versiyon 11: Kritik dosya fingerprint cache invalidation eklendi
+	CurrentCacheVersion = 13 // Versiyon 13: Docker servis durumlari ayri model alani oldu
 	cacheFileName       = ".devterminal_cache.json"
 )
 
@@ -1311,6 +1311,39 @@ func componentEnvWarnings(rootPath, componentPath string, role domain.ComponentR
 	return warnings
 }
 
+func refreshProjectRuntimePorts(p *domain.Project) {
+	p.PortWarnings = nil
+	p.DependencyPortStatuses = nil
+	p.DockerServices = nil
+
+	portInfos := CheckProjectPortsForProject(*p, "full")
+	for _, info := range portInfos {
+		p.PortWarnings = append(p.PortWarnings, FormatPortWarning(info))
+	}
+
+	dependencyPortInfos := CheckProjectDependencyPortsForProject(*p, "full")
+	for _, info := range dependencyPortInfos {
+		p.DependencyPortStatuses = append(p.DependencyPortStatuses, FormatDependencyPortStatus(info))
+
+		name := strings.TrimSpace(info.Label)
+		if name == "" {
+			name = "Docker"
+		}
+		status := "Bekleniyor"
+		if info.InUse {
+			status = "Hazır"
+		}
+		p.DockerServices = append(p.DockerServices, domain.DockerServiceStatus{
+			Name:      name,
+			Port:      info.Port,
+			Status:    status,
+			Process:   info.Process,
+			ProcessID: info.ProcessID,
+			InUse:     info.InUse,
+		})
+	}
+}
+
 func componentName(projectName, componentPath, fallback string) string {
 	if componentPath == "" {
 		return fallback
@@ -1335,6 +1368,7 @@ func (s *Scanner) ScanProjects() []domain.Project {
 			// Scriptleri her zaman taze tut
 			projects[i].Scripts = s.scanPackageScripts(&projects[i])
 			syncProjectComponents(&projects[i])
+			refreshProjectRuntimePorts(&projects[i])
 		}
 
 		// Cache'den gelen projeler için de config senkronizasyonu yap
@@ -1769,11 +1803,7 @@ func (s *Scanner) scanDirectory(root string) []domain.Project {
 			// Yerel config kalıntısı temizliği yapılabilir ama şimdilik gerek yok
 			// s.manageProjectConfig(&p) kaldırıldı.
 
-			// Port kontrolü yap
-			portInfos := CheckProjectPortsForProject(p, "full")
-			for _, info := range portInfos {
-				p.PortWarnings = append(p.PortWarnings, FormatPortWarning(info))
-			}
+			refreshProjectRuntimePorts(&p)
 
 			// Package Scripts taraması
 			p.Scripts = s.scanPackageScripts(&p)

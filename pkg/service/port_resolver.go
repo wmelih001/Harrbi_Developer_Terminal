@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"devterminal/pkg/domain"
+
+	"gopkg.in/yaml.v3"
 )
 
 type PortSource string
@@ -22,12 +24,14 @@ const (
 )
 
 type ResolvedPort struct {
-	Port       int
-	Role       domain.ComponentRole
-	Source     PortSource
-	Path       string
-	Detail     string
-	Confidence int
+	Port         int
+	Role         domain.ComponentRole
+	Source       PortSource
+	Path         string
+	Detail       string
+	Label        string
+	Confidence   int
+	BlocksLaunch bool
 }
 
 type PortResolveRequest struct {
@@ -100,6 +104,9 @@ func CheckProjectPortsForProject(p domain.Project, mode string) []PortInfo {
 	var results []PortInfo
 	checked := make(map[int]bool)
 	for _, resolved := range ResolveProjectPorts(p, mode) {
+		if !resolved.BlocksLaunch {
+			continue
+		}
 		if checked[resolved.Port] {
 			continue
 		}
@@ -108,6 +115,24 @@ func CheckProjectPortsForProject(p domain.Project, mode string) []PortInfo {
 		if info.InUse {
 			results = append(results, info)
 		}
+	}
+	return results
+}
+
+func CheckProjectDependencyPortsForProject(p domain.Project, mode string) []PortInfo {
+	var results []PortInfo
+	checked := make(map[int]bool)
+	for _, resolved := range ResolveProjectPorts(p, mode) {
+		if resolved.BlocksLaunch || resolved.Source != PortSourceDocker {
+			continue
+		}
+		if checked[resolved.Port] {
+			continue
+		}
+		checked[resolved.Port] = true
+		info := GetPortInfo(resolved.Port)
+		info.Label = resolved.Label
+		results = append(results, info)
 	}
 	return results
 }
@@ -159,12 +184,13 @@ func portsFromCommand(command string, role domain.ComponentRole, source PortSour
 	var ports []ResolvedPort
 	for _, port := range parseCommandPorts(command) {
 		ports = append(ports, ResolvedPort{
-			Port:       port,
-			Role:       role,
-			Source:     source,
-			Path:       path,
-			Detail:     strings.TrimSpace(command),
-			Confidence: confidence,
+			Port:         port,
+			Role:         role,
+			Source:       source,
+			Path:         path,
+			Detail:       strings.TrimSpace(command),
+			Confidence:   confidence,
+			BlocksLaunch: true,
 		})
 	}
 	return ports
@@ -191,12 +217,13 @@ func portsFromEnv(rootPath, componentPath string, role domain.ComponentRole) []R
 				continue
 			}
 			ports = append(ports, ResolvedPort{
-				Port:       port,
-				Role:       role,
-				Source:     PortSourceEnv,
-				Path:       file.Path,
-				Detail:     key,
-				Confidence: 90,
+				Port:         port,
+				Role:         role,
+				Source:       PortSourceEnv,
+				Path:         file.Path,
+				Detail:       key,
+				Confidence:   90,
+				BlocksLaunch: true,
 			})
 		}
 	}
@@ -243,12 +270,13 @@ func portsFromCode(rootPath, componentPath string, role domain.ComponentRole) []
 			}
 			for _, port := range parseCodePorts(string(data)) {
 				ports = append(ports, ResolvedPort{
-					Port:       port,
-					Role:       role,
-					Source:     PortSourceCode,
-					Path:       fullPath,
-					Detail:     "listen",
-					Confidence: 86,
+					Port:         port,
+					Role:         role,
+					Source:       PortSourceCode,
+					Path:         fullPath,
+					Detail:       "listen",
+					Confidence:   86,
+					BlocksLaunch: true,
 				})
 			}
 		}
@@ -275,12 +303,14 @@ func portsFromDocker(rootPath, componentPath string, role domain.ComponentRole) 
 			}
 			for _, port := range parseDockerComposePorts(string(data)) {
 				ports = append(ports, ResolvedPort{
-					Port:       port,
-					Role:       role,
-					Source:     PortSourceDocker,
-					Path:       fullPath,
-					Detail:     "ports mapping",
-					Confidence: 80,
+					Port:         port.Port,
+					Role:         role,
+					Source:       PortSourceDocker,
+					Path:         fullPath,
+					Detail:       port.ServiceName,
+					Label:        port.Label,
+					Confidence:   80,
+					BlocksLaunch: false,
 				})
 			}
 		}
@@ -288,11 +318,146 @@ func portsFromDocker(rootPath, componentPath string, role domain.ComponentRole) 
 	return ports
 }
 
-func parseDockerComposePorts(content string) []int {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`["']?(\d{2,5})\s*:\s*\d{2,5}["']?`),
+type dockerComposePort struct {
+	Port        int
+	ServiceName string
+	Label       string
+}
+
+func parseDockerComposePorts(content string) []dockerComposePort {
+	type composeService struct {
+		Image string        `yaml:"image"`
+		Ports []interface{} `yaml:"ports"`
 	}
-	return portsFromPatterns(content, patterns)
+	type composeFile struct {
+		Services map[string]composeService `yaml:"services"`
+	}
+
+	var compose composeFile
+	if err := yaml.Unmarshal([]byte(content), &compose); err != nil || len(compose.Services) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var ports []dockerComposePort
+	for name, service := range compose.Services {
+		label, ok := dockerDependencyLabel(name, service.Image)
+		if !ok {
+			continue
+		}
+		for _, item := range service.Ports {
+			port, ok := dockerHostPort(item)
+			key := strconv.Itoa(port) + "|" + label
+			if ok && !seen[key] {
+				seen[key] = true
+				ports = append(ports, dockerComposePort{
+					Port:        port,
+					ServiceName: name,
+					Label:       label,
+				})
+			}
+		}
+	}
+	sort.Slice(ports, func(i, j int) bool {
+		if ports[i].Port == ports[j].Port {
+			return ports[i].Label < ports[j].Label
+		}
+		return ports[i].Port < ports[j].Port
+	})
+	return ports
+}
+
+func isDockerDependencyService(name, image string) bool {
+	_, ok := dockerDependencyLabel(name, image)
+	return ok
+}
+
+func dockerDependencyLabel(name, image string) (string, bool) {
+	text := strings.ToLower(name + " " + image)
+	labelHints := []struct {
+		Hints []string
+		Label string
+	}{
+		{[]string{"pgbouncer", "pgboun"}, "PgBouncer"},
+		{[]string{"postgres", "postgre"}, "Postgres"},
+		{[]string{"redis"}, "Redis"},
+		{[]string{"mysql"}, "MySQL"},
+		{[]string{"mariadb"}, "MariaDB"},
+		{[]string{"mongodb", "mongo"}, "MongoDB"},
+		{[]string{"mssql", "sqlserver"}, "SQL Server"},
+		{[]string{"clickhouse"}, "ClickHouse"},
+		{[]string{"rabbitmq"}, "RabbitMQ"},
+		{[]string{"kafka"}, "Kafka"},
+		{[]string{"zookeeper"}, "ZooKeeper"},
+		{[]string{"minio"}, "MinIO"},
+		{[]string{"elasticsearch"}, "Elasticsearch"},
+		{[]string{"opensearch"}, "OpenSearch"},
+		{[]string{"meilisearch"}, "Meilisearch"},
+		{[]string{"typesense"}, "Typesense"},
+		{[]string{"mailhog"}, "MailHog"},
+		{[]string{"mailpit"}, "Mailpit"},
+	}
+	for _, item := range labelHints {
+		for _, hint := range item.Hints {
+			if strings.Contains(text, hint) {
+				return item.Label, true
+			}
+		}
+	}
+	return "", false
+}
+
+func dockerHostPort(item interface{}) (int, bool) {
+	switch value := item.(type) {
+	case string:
+		return dockerHostPortFromString(value)
+	case map[string]interface{}:
+		return dockerHostPortFromMap(value)
+	case map[interface{}]interface{}:
+		normalized := make(map[string]interface{})
+		for k, v := range value {
+			if key, ok := k.(string); ok {
+				normalized[key] = v
+			}
+		}
+		return dockerHostPortFromMap(normalized)
+	default:
+		return 0, false
+	}
+}
+
+func dockerHostPortFromString(value string) (int, bool) {
+	value = strings.TrimSpace(strings.Trim(value, `"'`))
+	if value == "" || strings.Contains(value, "${") {
+		return 0, false
+	}
+	value = strings.Split(value, "/")[0]
+	parts := strings.Split(value, ":")
+	if len(parts) < 2 {
+		return 0, false
+	}
+	hostPart := parts[len(parts)-2]
+	if strings.Contains(hostPart, "-") {
+		hostPart = strings.Split(hostPart, "-")[0]
+	}
+	return parsePort(hostPart)
+}
+
+func dockerHostPortFromMap(value map[string]interface{}) (int, bool) {
+	published, ok := value["published"]
+	if !ok {
+		return 0, false
+	}
+	switch v := published.(type) {
+	case int:
+		return parsePort(strconv.Itoa(v))
+	case int64:
+		return parsePort(strconv.FormatInt(v, 10))
+	case string:
+		return parsePort(v)
+	default:
+		return 0, false
+	}
 }
 
 func portsFromPatterns(content string, patterns []*regexp.Regexp) []int {
@@ -398,12 +563,13 @@ func fallbackResolvedPorts(p domain.Project, mode string) []ResolvedPort {
 	add := func(role domain.ComponentRole, values []int) {
 		for _, port := range values {
 			ports = append(ports, ResolvedPort{
-				Port:       port,
-				Role:       role,
-				Source:     PortSourceFallback,
-				Path:       p.Path,
-				Detail:     "common dev port",
-				Confidence: 30,
+				Port:         port,
+				Role:         role,
+				Source:       PortSourceFallback,
+				Path:         p.Path,
+				Detail:       "common dev port",
+				Confidence:   30,
+				BlocksLaunch: true,
 			})
 		}
 	}

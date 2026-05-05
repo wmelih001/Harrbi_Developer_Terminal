@@ -87,6 +87,16 @@ type ProjectComponent struct {
 	EnvWarnings []string
 }
 
+// DockerServiceStatus docker-compose bagimlilik servisinin runtime durumunu temsil eder.
+type DockerServiceStatus struct {
+	Name      string
+	Port      int
+	Status    string
+	Process   string
+	ProcessID int
+	InUse     bool
+}
+
 // Project diskteki bir geliştirici projesini temsil eder
 type Project struct {
 	Name         string
@@ -129,7 +139,9 @@ type Project struct {
 	HealthScore   int      // 0-100 arası sağlık puanı
 	HealthDetails []string // Sağlık skoru detayları (hangi kriterler var/yok)
 	// Port uyarıları
-	PortWarnings []string // Kullanımda olan portlar
+	PortWarnings           []string // Kullanımda olan uygulama portları
+	DependencyPortStatuses []string // Docker gibi bağımlılık portlarının durumu
+	DockerServices         []DockerServiceStatus
 
 	// Package Scripts
 	Scripts map[string]string // package.json scripts (key: script name, value: command)
