@@ -112,6 +112,8 @@ type MainModel struct {
 
 	// Doctor State
 	IsUpdatingDependencies bool // Güncelleme işlemi sürüyor mu? (Legacy flag, maybe unused in new state)
+	DependencyTargets      []service.DependencyTarget
+	DependencyTargetIndex  int
 
 	// Splash
 	SplashProgress float64
@@ -121,6 +123,17 @@ type UpdateVersionInfo struct {
 	From string
 	To   string
 }
+
+type dbToolAction int
+
+const (
+	dbToolNone dbToolAction = iota
+	dbToolPrisma
+	dbToolDrizzle
+	dbToolHasura
+	dbToolSupabase
+	dbToolStorybook
+)
 
 // Custom Messages
 type splashTickMsg time.Time
@@ -250,10 +263,9 @@ func newTable() table.Model {
 
 func (m *MainModel) Init() tea.Cmd {
 	var cmds []tea.Cmd
-	cmds = append(cmds, spinner.Tick)
 
 	if m.State == StateScanning {
-		cmds = append(cmds, m.scanProjectsCmd())
+		cmds = append(cmds, m.startScanningCmd())
 	}
 	if m.State == StateSplash {
 		cmds = append(cmds, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
@@ -268,6 +280,15 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		if m.State == StateProjectActions &&
+			msg.Button == tea.MouseButtonLeft &&
+			msg.Action == tea.MouseActionPress {
+			if action := m.dbToolActionAtY(msg.Y); action != dbToolNone {
+				return m, m.launchDbToolCmd(action)
+			}
+		}
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -288,7 +309,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Allow skipping splash
 			if msg.String() == "enter" || msg.String() == "esc" || msg.String() == " " {
 				m.State = StateScanning
-				return m, m.scanProjectsCmd()
+				return m, m.startScanningCmd()
 			}
 
 		case StateFirstRun:
@@ -303,7 +324,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.Err = err
 					} else {
 						m.State = StateScanning
-						cmds = append(cmds, m.scanProjectsCmd())
+						cmds = append(cmds, m.startScanningCmd())
 					}
 					return m, tea.Batch(cmds...)
 				}
@@ -353,6 +374,16 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "q":
 				return m, tea.Quit
+			case "tab":
+				m.ensureDependencyTargets()
+				if len(m.DependencyTargets) > 1 {
+					m.DependencyTargetIndex = (m.DependencyTargetIndex + 1) % len(m.DependencyTargets)
+					m.Table.SetRows([]table.Row{})
+					m.AllPackagesUpToDate = false
+					m.Err = nil
+					m.IsUpdatingDependencies = true
+					return m, tea.Batch(m.Spinner.Tick, m.checkDependenciesCmd())
+				}
 			case "f":
 				// Update ALL packages (only those not up-to-date)
 				var pkgsToUpdate []string
@@ -378,7 +409,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Switch to Spinner immediately
 				m.IsUpdatingDependencies = true
 				// Async preparation
-				return m, tea.Batch(m.Spinner.Tick, m.prepareUpdateCmd(m.Selected, pkgsToUpdate, versionsToUpdate))
+				return m, tea.Batch(m.Spinner.Tick, m.prepareUpdateCmd(pkgsToUpdate, versionsToUpdate))
 
 			case "enter":
 				// Update SELECTED package
@@ -395,7 +426,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						versionsToUpdate[pkgName] = UpdateVersionInfo{From: row[1], To: row[3]}
 
 						m.IsUpdatingDependencies = true
-						return m, tea.Batch(m.Spinner.Tick, m.prepareUpdateCmd(m.Selected, []string{pkgName}, versionsToUpdate))
+						return m, tea.Batch(m.Spinner.Tick, m.prepareUpdateCmd([]string{pkgName}, versionsToUpdate))
 					}
 				}
 			}
@@ -411,6 +442,8 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.UpdateCommands = nil
 					m.UpdatePkgs = nil
 					m.UpdateVersions = nil
+					m.Table.SetRows([]table.Row{})
+					m.AllPackagesUpToDate = false
 					return m, tea.Batch(m.Spinner.Tick, m.checkDependenciesCmd())
 				}
 			}
@@ -626,10 +659,14 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case StateProjectActions:
+			if action := dbToolActionForKey(msg.String(), m.Selected); action != dbToolNone {
+				return m, m.launchDbToolCmd(action)
+			}
+
 			switch msg.String() {
 			case "1", "f":
 				// Port Check: Frontend
-				warnings := service.CheckProjectPorts(true, false)
+				warnings := service.CheckProjectPortsForProject(*m.Selected, "frontend")
 				if len(warnings) > 0 {
 					m.PortWarnings = warnings
 					m.PendingLaunchMode = "frontend"
@@ -641,7 +678,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, func() tea.Msg { m.Launcher.LaunchProject(m.Selected, "frontend"); return nil }
 			case "2", "b":
 				// Port Check: Backend
-				warnings := service.CheckProjectPorts(false, true)
+				warnings := service.CheckProjectPortsForProject(*m.Selected, "backend")
 				if len(warnings) > 0 {
 					m.PortWarnings = warnings
 					m.PendingLaunchMode = "backend"
@@ -653,7 +690,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, func() tea.Msg { m.Launcher.LaunchProject(m.Selected, "backend"); return nil }
 			case "3", "l":
 				// Port Check: Full
-				warnings := service.CheckProjectPorts(true, true)
+				warnings := service.CheckProjectPortsForProject(*m.Selected, "full")
 				if len(warnings) > 0 {
 					m.PortWarnings = warnings
 					m.PendingLaunchMode = "full"
@@ -684,38 +721,15 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return contextMsg(tree)
 				}
-			// Shortcuts for Tools
-			case "f1":
-				if m.Selected.HasPrisma {
-					return m, func() tea.Msg { _ = m.Launcher.LaunchPrisma(m.Selected); return nil }
-				}
-			case "f2":
-				if m.Selected.HasDrizzle {
-					return m, func() tea.Msg { _ = m.Launcher.LaunchDrizzle(m.Selected); return nil }
-				}
-			case "f3":
-				if m.Selected.HasHasura {
-					return m, func() tea.Msg { _ = m.Launcher.LaunchHasura(m.Selected); return nil }
-				}
-			case "f4":
-				if m.Selected.HasSupabase {
-					return m, func() tea.Msg { _ = m.Launcher.LaunchSupabase(m.Selected); return nil }
-				}
-			case "f5":
-				if m.Selected.HasStorybook {
-					return m, func() tea.Msg { _ = m.Launcher.LaunchStorybook(m.Selected); return nil }
-				}
 			case "6":
 				// Doctor
 				m.State = StateDependencyDoctor
-				m.Err = nil
-				m.Table.SetRows([]table.Row{}) // Clear old results
-				m.AllPackagesUpToDate = false  // Reset flag
+				m.resetDependencyDoctor()
 				return m, tea.Batch(m.Spinner.Tick, m.checkDependenciesCmd())
 
 			case "h", "H": // Hidden shortcut for health? No, let's stick to requested "
 				// Health Score Trigger
-				report := m.HealthService.CheckHealth(m.Selected.Path)
+				report := m.HealthService.CheckProjectHealth(*m.Selected)
 				m.HealthReport = &report
 				m.State = StateHealthScore
 				return m, nil
@@ -1083,14 +1097,19 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case doctorMsg:
 		m.IsUpdatingDependencies = false
-		if len(msg) == 0 {
+		result := msg.result
+		currentTarget := m.currentDependencyTarget()
+		if msg.target.Path != "" && currentTarget.Path != "" && msg.target.Path != currentTarget.Path {
+			return m, tea.Batch(cmds...)
+		}
+		if len(result) == 0 {
 			// No dependencies found at all
 			m.Table.SetRows([]table.Row{})
 			m.AllPackagesUpToDate = true
 		} else {
 			// Populate table with ALL packages (sorted)
-			keys := make([]string, 0, len(msg))
-			for k := range msg {
+			keys := make([]string, 0, len(result))
+			for k := range result {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
@@ -1098,7 +1117,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			rows := []table.Row{}
 			allUpToDate := true
 			for _, k := range keys {
-				info := msg[k]
+				info := result[k]
 				latestDisplay := info.Latest
 				if info.Current == info.Latest {
 					latestDisplay = "latest"
@@ -1119,7 +1138,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.SplashProgress >= 1.0 {
 				m.SplashProgress = 1.0
 				m.State = StateScanning // Animasyon bitti, taramaya başla
-				cmds = append(cmds, m.scanProjectsCmd())
+				cmds = append(cmds, m.startScanningCmd())
 			} else {
 				cmds = append(cmds, tea.Tick(time.Millisecond*15, func(t time.Time) tea.Msg {
 					return splashTickMsg(t)
@@ -1154,7 +1173,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key, ok := msg.(tea.KeyMsg); ok && key.String() == "r" && m.List.FilterState() != list.Filtering {
 			m.Scanner.ClearCache()
 			m.State = StateScanning
-			cmds = append(cmds, m.scanProjectsCmd())
+			cmds = append(cmds, m.startScanningCmd())
 			return m, tea.Batch(cmds...)
 		}
 
@@ -1186,7 +1205,7 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.List.Title == "Bağımlılık Kontrolü İçin Proje Seç" {
 						// Doktoru çalıştır
 						m.State = StateDependencyDoctor
-						m.Err = nil
+						m.resetDependencyDoctor()
 						// Spinner başlat ve komutu tetikle
 						cmds = append(cmds, m.Spinner.Tick, m.checkDependenciesCmd())
 					} else {
@@ -1202,12 +1221,159 @@ func (m *MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *MainModel) checkDependenciesCmd() tea.Cmd {
+	target := m.currentDependencyTarget()
+	selected := m.Selected
 	return func() tea.Msg {
-		res, err := m.Doctor.CheckDependencies(m.Selected)
+		if selected == nil {
+			return errMsg(fmt.Errorf("proje seçilmedi"))
+		}
+		if m.Doctor == nil {
+			return errMsg(fmt.Errorf("dependency doctor hazır değil"))
+		}
+
+		var (
+			res service.NpmOutdatedResult
+			err error
+		)
+		if target.Path == "" {
+			res, err = m.Doctor.CheckDependencies(selected)
+		} else {
+			res, err = m.Doctor.CheckTargetDependencies(target)
+		}
 		if err != nil {
 			return errMsg(err)
 		}
-		return doctorMsg(res)
+		return doctorMsg{target: target, result: res}
+	}
+}
+
+func (m *MainModel) resetDependencyDoctor() {
+	m.DependencyTargets = nil
+	m.DependencyTargetIndex = 0
+	m.ensureDependencyTargets()
+	m.Table.SetRows([]table.Row{})
+	m.AllPackagesUpToDate = false
+	m.Err = nil
+}
+
+func (m *MainModel) ensureDependencyTargets() {
+	if len(m.DependencyTargets) == 0 && m.Doctor != nil && m.Selected != nil {
+		m.DependencyTargets = m.Doctor.DependencyTargets(m.Selected)
+	}
+	if m.DependencyTargetIndex < 0 || m.DependencyTargetIndex >= len(m.DependencyTargets) {
+		m.DependencyTargetIndex = 0
+	}
+}
+
+func (m *MainModel) currentDependencyTarget() service.DependencyTarget {
+	m.ensureDependencyTargets()
+	if len(m.DependencyTargets) == 0 {
+		return service.DependencyTarget{}
+	}
+	return m.DependencyTargets[m.DependencyTargetIndex]
+}
+
+func (m *MainModel) dependencyDoctorTitle() string {
+	if m.Selected == nil {
+		return "Doktor Raporu"
+	}
+	targetLabel := m.dependencyTargetLabel()
+	if targetLabel == "" {
+		return fmt.Sprintf("%s İçin Doktor Raporu", m.Selected.Name)
+	}
+	return fmt.Sprintf("%s / %s İçin Doktor Raporu", m.Selected.Name, targetLabel)
+}
+
+func (m *MainModel) dependencyTargetLabel() string {
+	target := m.currentDependencyTarget()
+	if target.Label != "" {
+		return target.Label
+	}
+	return target.Name
+}
+
+func dbToolActionForKey(key string, project *domain.Project) dbToolAction {
+	switch strings.ToLower(key) {
+	case "f1":
+		if project != nil && project.HasPrisma {
+			return dbToolPrisma
+		}
+	case "f2":
+		if project != nil && project.HasDrizzle {
+			return dbToolDrizzle
+		}
+	case "f3":
+		if project != nil && project.HasHasura {
+			return dbToolHasura
+		}
+	case "f4":
+		if project != nil && project.HasSupabase {
+			return dbToolSupabase
+		}
+	case "f5":
+		if project != nil && project.HasStorybook {
+			return dbToolStorybook
+		}
+	}
+	return dbToolNone
+}
+
+func dbToolActionForLine(line string, project *domain.Project) dbToolAction {
+	if strings.Contains(line, "[F1]") && project != nil && project.HasPrisma {
+		return dbToolPrisma
+	}
+	if strings.Contains(line, "[F2]") && project != nil && project.HasDrizzle {
+		return dbToolDrizzle
+	}
+	if strings.Contains(line, "[F3]") && project != nil && project.HasHasura {
+		return dbToolHasura
+	}
+	if strings.Contains(line, "[F4]") && project != nil && project.HasSupabase {
+		return dbToolSupabase
+	}
+	if strings.Contains(line, "[F5]") && project != nil && project.HasStorybook {
+		return dbToolStorybook
+	}
+	return dbToolNone
+}
+
+func (m *MainModel) dbToolActionAtY(y int) dbToolAction {
+	lines := strings.Split(m.actionsView(), "\n")
+	for _, index := range []int{y, y - 1} {
+		if index < 0 || index >= len(lines) {
+			continue
+		}
+		if action := dbToolActionForLine(lines[index], m.Selected); action != dbToolNone {
+			return action
+		}
+	}
+	return dbToolNone
+}
+
+func (m *MainModel) launchDbToolCmd(action dbToolAction) tea.Cmd {
+	return func() tea.Msg {
+		if m.Selected == nil {
+			return errMsg(fmt.Errorf("proje seçilmedi"))
+		}
+		var err error
+		switch action {
+		case dbToolPrisma:
+			err = m.Launcher.LaunchPrisma(m.Selected)
+		case dbToolDrizzle:
+			err = m.Launcher.LaunchDrizzle(m.Selected)
+		case dbToolHasura:
+			err = m.Launcher.LaunchHasura(m.Selected)
+		case dbToolSupabase:
+			err = m.Launcher.LaunchSupabase(m.Selected)
+		case dbToolStorybook:
+			err = m.Launcher.LaunchStorybook(m.Selected)
+		default:
+			return nil
+		}
+		if err != nil {
+			return errMsg(err)
+		}
+		return nil
 	}
 }
 
@@ -1272,6 +1438,7 @@ func (m *MainModel) View() string {
 		return lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, box)
 
 	case StateDependencyDoctor:
+		title := m.dependencyDoctorTitle()
 		// Show error if exists (Higher priority)
 		if m.Err != nil {
 			// Stop loading if error occurred
@@ -1285,15 +1452,24 @@ func (m *MainModel) View() string {
 			errorMsg := lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#ff5555")).
 				Render(fmt.Sprintf("\n  ⚠️  Hata: %s", m.Err.Error()))
-			return fmt.Sprintf("\n  %s İçin Doktor Raporu\n%s\n\n  %s", m.Selected.Name, errorMsg, footer)
+			return fmt.Sprintf("\n  %s\n%s\n\n  %s", title, errorMsg, footer)
 		}
 
 		// Update in progress?
 		if m.IsUpdatingDependencies {
-			return fmt.Sprintf("\n\n   %s Paketler güncelleniyor...\n\n   📦 %s için işlem yapılıyor.\n   (Bu işlem internet hızınıza göre zaman alabilir)", m.Spinner.View(), m.Selected.Name)
+			targetLabel := m.dependencyTargetLabel()
+			if targetLabel == "" && m.Selected != nil {
+				targetLabel = m.Selected.Name
+			}
+			return fmt.Sprintf("\n\n   %s Paketler güncelleniyor...\n\n   %s için işlem yapılıyor.\n   (Bu işlem internet hızınıza göre zaman alabilir)", m.Spinner.View(), targetLabel)
 		}
 
-		footer := m.renderFooter("Enter", "Seçileni Güncelle", "f", "Tümünü Güncelle", "Esc", "Geri Dön")
+		footerPairs := []string{"Enter", "Seçileni Güncelle", "f", "Tümünü Güncelle", "Esc", "Geri Dön"}
+		m.ensureDependencyTargets()
+		if len(m.DependencyTargets) > 1 {
+			footerPairs = append([]string{"Tab", "Bileşen"}, footerPairs...)
+		}
+		footer := m.renderFooter(footerPairs...)
 
 		// Show loading or results
 		var tableView string
@@ -1313,7 +1489,7 @@ func (m *MainModel) View() string {
 			tableView = "\n" + m.Table.View()
 		}
 
-		return fmt.Sprintf("\n  %s İçin Doktor Raporu\n%s\n\n  %s", m.Selected.Name, tableView, footer)
+		return fmt.Sprintf("\n  %s\n%s\n\n  %s", title, tableView, footer)
 	case StateNgrok:
 		return m.ngrokView()
 	case StateHealthScore:
@@ -1332,7 +1508,10 @@ func (m *MainModel) View() string {
 // Msg types
 type errMsg error
 type contextMsg string
-type doctorMsg service.NpmOutdatedResult
+type doctorMsg struct {
+	target service.DependencyTarget
+	result service.NpmOutdatedResult
+}
 type ngrokInstalledMsg string // changed to string (path)
 type ngrokAuthMsg bool
 
@@ -1445,6 +1624,10 @@ func (m *MainModel) scanProjectsCmd() tea.Cmd {
 		projs := m.Scanner.ScanProjects()
 		return projectMsg(projs)
 	}
+}
+
+func (m *MainModel) startScanningCmd() tea.Cmd {
+	return tea.Batch(m.Spinner.Tick, m.scanProjectsCmd())
 }
 
 // List Item Adapter
@@ -1603,9 +1786,26 @@ func (m *MainModel) runNextUpdateCmd() tea.Msg {
 	return updateCmdFinishedMsg{output: string(output), err: err}
 }
 
-func (m *MainModel) prepareUpdateCmd(proj *domain.Project, pkgs []string, versions map[string]UpdateVersionInfo) tea.Cmd {
+func (m *MainModel) prepareUpdateCmd(pkgs []string, versions map[string]UpdateVersionInfo) tea.Cmd {
+	target := m.currentDependencyTarget()
+	selected := m.Selected
 	return func() tea.Msg {
-		cmds, finalPkgs, err := m.Doctor.GetUpdateCommands(proj, pkgs)
+		var (
+			cmds      []*exec.Cmd
+			finalPkgs []string
+			err       error
+		)
+		if m.Doctor == nil {
+			err = fmt.Errorf("dependency doctor hazır değil")
+		} else if target.Path == "" {
+			if selected == nil {
+				err = fmt.Errorf("proje seçilmedi")
+			} else {
+				cmds, finalPkgs, err = m.Doctor.GetUpdateCommands(selected, pkgs)
+			}
+		} else {
+			cmds, finalPkgs, err = m.Doctor.GetUpdateCommandsForTarget(target, pkgs)
+		}
 		return updatePrepMsg{
 			cmds:     cmds,
 			pkgs:     finalPkgs,

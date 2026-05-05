@@ -26,7 +26,8 @@ Modern ve klavye odaklı yeni nesil Geliştirici Kontrol Paneli.
 
 ### <img src="assets/icons/launch.png" width="20"> Akıllı Proje Başlatıcı
 Çalışma alanınızı saniyeler içinde tarar. Tek tuşla projelerinizi Windows Terminal sekmelerinde başlatır.
-- **Frontend & Backend Algılama:** `package.json` analizi ile `npm run dev` veya `go run .` gibi komutları otomatik seçer.
+- **Component-Aware Algılama:** `api`, `web`, `apps/*` gibi yapıları frontend/backend bileşeni olarak tanır.
+- **Akıllı Komut Seçimi:** Script adı, script içeriği, klasör adı ve role bilgisiyle doğru start komutunu seçer.
 - **Full Stack Modu:** Terminali ikiye bölerek hem client hem server'ı aynı anda kaldırır.
 
 ### <img src="assets/icons/script.png" width="20"> Script & Task Runner
@@ -41,11 +42,12 @@ LLM'ler (ChatGPT, Claude) için kod tabanınızı hazırlayın.
 - Çıktıyı anında panoya kopyalar, prompt'unuza yapıştırmaya hazırdır.
 
 ### <img src="assets/icons/health.png" width="20"> Proje Sağlık Merkezi
-- **Bağımlılık Doktoru:** Güncelliğini yitirmiş paketleri terminalden çıkmadan `npm outdated` analizi ile bulun.
-- **Sağlık Skoru:** Projenizi Git durumu, CI/CD, Docker, Linter varlığı gibi kriterlere göre 100 üzerinden puanlar. Eksikleri raporlar.
+- **Bağımlılık Doktoru:** Root, frontend ve backend bileşenleri için ayrı dependency kontrolü yapar.
+- **Package Manager Desteği:** `npm`, `pnpm`, `yarn`, `bun` ve gerektiğinde `corepack` fallback kullanır.
+- **Sağlık Skoru:** Genel proje, frontend, backend ve monorepo kriterlerine göre 100 üzerinden puanlar.
 
 ### <img src="assets/icons/shield.png" width="20"> Port & Tünel Yönetimi
-- **Port Çakışma Kilidi:** Projeyi başlatmadan önce portun (örn: 3000) dolu olup olmadığını kontrol eder.
+- **Dinamik Port Kontrolü:** Script, env, framework config ve docker-compose içinden portları çıkarır.
 - **Ngrok Entegrasyonu:** Tünel durumunu ve public URL'inizi doğrudan panodan izleyin.
 
 ### <img src="assets/icons/tools.png" width="20"> Gömülü Geliştirici Araçları

@@ -10,7 +10,10 @@ import (
 )
 
 func main() {
-	p := tea.NewProgram(ui.NewMainModel(), tea.WithAltScreen())
+	opts, cleanup := programOptions()
+	defer cleanup()
+
+	p := tea.NewProgram(ui.NewMainModel(), opts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)
 		os.Exit(1)

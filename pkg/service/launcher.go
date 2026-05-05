@@ -119,59 +119,85 @@ func parseArgs(cmd string) []string {
 
 // LaunchPrisma opens Prisma Studio for the project
 func (l *Launcher) LaunchPrisma(p *domain.Project) error {
-	path := p.Path
-	if p.PrismaPath != "" {
-		path = p.PrismaPath
-	}
-	cmdStr := fmt.Sprintf(`wt -w 0 nt --title "Prisma Studio" -d "%s" cmd /k "npx prisma studio"`, path)
-
-	args := parseArgs(cmdStr)
-	if len(args) == 0 {
-		return fmt.Errorf("failed to create prisma command")
-	}
-
-	c := exec.Command(args[0], args[1:]...)
-	return c.Start()
+	return l.runCmd(l.prismaCommand(p))
 }
 
 // LaunchDrizzle opens Drizzle Studio
 func (l *Launcher) LaunchDrizzle(p *domain.Project) error {
-	path := p.Path
-	if p.DrizzlePath != "" {
-		path = p.DrizzlePath
-	}
-	cmdStr := fmt.Sprintf(`wt -w 0 nt --title "Drizzle Studio" -d "%s" cmd /k "npx drizzle-kit studio"`, path)
-	return l.runCmd(cmdStr)
+	return l.runCmd(l.drizzleCommand(p))
 }
 
 // LaunchHasura opens Hasura Console
 func (l *Launcher) LaunchHasura(p *domain.Project) error {
-	path := p.Path
-	if p.HasuraPath != "" {
-		path = p.HasuraPath
-	}
-	cmdStr := fmt.Sprintf(`wt -w 0 nt --title "Hasura Console" -d "%s" cmd /k "hasura console"`, path)
-	return l.runCmd(cmdStr)
+	return l.runCmd(l.hasuraCommand(p))
 }
 
 // LaunchSupabase opens Supabase Dashboard
 func (l *Launcher) LaunchSupabase(p *domain.Project) error {
-	path := p.Path
-	if p.SupabasePath != "" {
-		path = p.SupabasePath
-	}
-	cmdStr := fmt.Sprintf(`wt -w 0 nt --title "Supabase Status" -d "%s" cmd /k "npx supabase status"`, path)
-	return l.runCmd(cmdStr)
+	return l.runCmd(l.supabaseCommand(p))
 }
 
 // LaunchStorybook opens Storybook
 func (l *Launcher) LaunchStorybook(p *domain.Project) error {
+	return l.runCmd(l.storybookCommand(p))
+}
+
+func (l *Launcher) prismaCommand(p *domain.Project) string {
+	path := p.Path
+	if p.PrismaPath != "" {
+		path = p.PrismaPath
+	}
+	return toolTerminalCommand("Prisma Studio", path, packageManagerExecCommand(path, "prisma", "studio"))
+}
+
+func (l *Launcher) drizzleCommand(p *domain.Project) string {
+	path := p.Path
+	if p.DrizzlePath != "" {
+		path = p.DrizzlePath
+	}
+	return toolTerminalCommand("Drizzle Studio", path, packageManagerExecCommand(path, "drizzle-kit", "studio"))
+}
+
+func (l *Launcher) hasuraCommand(p *domain.Project) string {
+	path := p.Path
+	if p.HasuraPath != "" {
+		path = p.HasuraPath
+	}
+	return toolTerminalCommand("Hasura Console", path, "hasura console")
+}
+
+func (l *Launcher) supabaseCommand(p *domain.Project) string {
+	path := p.Path
+	if p.SupabasePath != "" {
+		path = p.SupabasePath
+	}
+	return toolTerminalCommand("Supabase Status", path, packageManagerExecCommand(path, "supabase", "status"))
+}
+
+func (l *Launcher) storybookCommand(p *domain.Project) string {
 	path := p.Path
 	if p.StorybookPath != "" {
 		path = p.StorybookPath
 	}
-	cmdStr := fmt.Sprintf(`wt -w 0 nt --title "Storybook" -d "%s" cmd /k "npm run storybook"`, path)
-	return l.runCmd(cmdStr)
+	return toolTerminalCommand("Storybook", path, packageManagerRunScriptCommand(path, "storybook"))
+}
+
+func toolTerminalCommand(title, path, runCmd string) string {
+	return fmt.Sprintf(`wt.exe -w 0 nt --title "%s" -d "%s" cmd /k "%s"`, title, path, runCmd)
+}
+
+func packageManagerExecCommand(path, binary string, args ...string) string {
+	manager := detectPackageManagerName(path)
+	command := packageManagerCommand(manager)
+	parts := append([]string{binary}, args...)
+	switch manager {
+	case packageManagerPnpm, packageManagerYarn:
+		return command + " exec " + strings.Join(parts, " ")
+	case packageManagerBun:
+		return command + " x " + strings.Join(parts, " ")
+	default:
+		return "npx " + strings.Join(parts, " ")
+	}
 }
 
 // LaunchScript opens a new terminal tab to run the selected package.json script

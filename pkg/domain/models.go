@@ -46,10 +46,45 @@ type DetectedTech struct {
 type SubProject struct {
 	Name       string      // Alt proje adı (klasör adı)
 	Path       string      // Alt proje yolu
+	WorkDir    string      // Komutun çalışacağı dizin
 	Type       ProjectType // Teknoloji tipi
 	Version    string      // Versiyon
 	StartCmd   string      // Başlatma komutu
 	IsFrontend bool        // Frontend mi Backend mi
+}
+
+// ComponentRole proje içindeki bileşenin görevini belirtir.
+type ComponentRole string
+
+const (
+	ComponentRoleFrontend ComponentRole = "frontend"
+	ComponentRoleBackend  ComponentRole = "backend"
+	ComponentRoleTool     ComponentRole = "tool"
+	ComponentRoleLibrary  ComponentRole = "library"
+	ComponentRoleUnknown  ComponentRole = "unknown"
+)
+
+// ComponentEvidence bileşen tespit kararının dayandığı sinyali temsil eder.
+type ComponentEvidence struct {
+	Kind   string
+	Source string
+	Detail string
+	Score  int
+}
+
+// ProjectComponent frontend, backend, tool veya library gibi proje bileşenlerini temsil eder.
+type ProjectComponent struct {
+	Name        string
+	Path        string
+	Role        ComponentRole
+	Type        ProjectType
+	Version     string
+	StartCmd    string
+	WorkDir     string
+	IsPrimary   bool
+	Confidence  int
+	Evidence    []ComponentEvidence
+	EnvWarnings []string
 }
 
 // Project diskteki bir geliştirici projesini temsil eder
@@ -89,6 +124,7 @@ type Project struct {
 	IsMonorepo   bool         // Monorepo projesi mi?
 	AllFrontends []SubProject // Tüm frontend alt projeleri
 	AllBackends  []SubProject // Tüm backend alt projeleri
+	Components   []ProjectComponent
 	// Proje sağlık skoru
 	HealthScore   int      // 0-100 arası sağlık puanı
 	HealthDetails []string // Sağlık skoru detayları (hangi kriterler var/yok)

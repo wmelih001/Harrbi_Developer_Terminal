@@ -244,33 +244,33 @@ func (m *MainModel) actionsView() string {
 		dockerRow = lipgloss.NewStyle().Foreground(borderColor).Render("│") + dockerContent + lipgloss.NewStyle().Foreground(borderColor).Render("│")
 	}
 
-	// 10. Monorepo alt projeleri (varsa)
+	// 10. Bilesenler (varsa)
 	var monorepoRows []string
 	var sep4 string
-	if p.IsMonorepo && (len(p.AllFrontends) > 1 || len(p.AllBackends) > 1) {
+	if p.IsMonorepo && (len(p.AllFrontends) > 0 || len(p.AllBackends) > 0) {
 		sep4 = lipgloss.NewStyle().Foreground(borderColor).Render("├" + strings.Repeat("─", innerW) + "┤")
 
-		// Başlık
-		monorepoHeader := fullRowStyle.Render(lipgloss.NewStyle().Foreground(ColorPurple).Bold(true).Render("📦 MONOREPO ALT PROJELERİ"))
+		// Baslik
+		monorepoHeader := fullRowStyle.Render(lipgloss.NewStyle().Foreground(ColorPurple).Bold(true).Render("📦 BİLEŞENLER"))
 		monorepoRows = append(monorepoRows, lipgloss.NewStyle().Foreground(borderColor).Render("│")+monorepoHeader+lipgloss.NewStyle().Foreground(borderColor).Render("│"))
 
-		// Frontend alt projeleri
+		// Frontend bilesenleri
 		for i, sub := range p.AllFrontends {
 			prefix := "  "
 			if i == 0 {
-				prefix = "→ " // Ana proje
+				prefix = "→ " // Birincil bilesen
 			}
-			subStr := fullRowStyle.Render(fmt.Sprintf("%s%s %s: %s", prefix, getTechIcon(string(sub.Type)), sub.Name, ValueStyle.Render(sub.Version)))
+			subStr := fullRowStyle.Render(fmt.Sprintf("%sFrontend %s %s: %s", prefix, getTechIcon(string(sub.Type)), sub.Name, ValueStyle.Render(sub.Version)))
 			monorepoRows = append(monorepoRows, lipgloss.NewStyle().Foreground(borderColor).Render("│")+subStr+lipgloss.NewStyle().Foreground(borderColor).Render("│"))
 		}
 
-		// Backend alt projeleri
+		// Backend bilesenleri
 		for i, sub := range p.AllBackends {
 			prefix := "  "
 			if i == 0 {
-				prefix = "→ " // Ana proje
+				prefix = "→ " // Birincil bilesen
 			}
-			subStr := fullRowStyle.Render(fmt.Sprintf("%s%s %s: %s", prefix, getTechIcon(string(sub.Type)), sub.Name, ValueStyle.Render(sub.Version)))
+			subStr := fullRowStyle.Render(fmt.Sprintf("%sBackend %s %s: %s", prefix, getTechIcon(string(sub.Type)), sub.Name, ValueStyle.Render(sub.Version)))
 			monorepoRows = append(monorepoRows, lipgloss.NewStyle().Foreground(borderColor).Render("│")+subStr+lipgloss.NewStyle().Foreground(borderColor).Render("│"))
 		}
 	}
@@ -308,7 +308,7 @@ func (m *MainModel) actionsView() string {
 			boxParts = append(boxParts, warningRow)
 		}
 	}
-	// Monorepo alt projeleri
+	// Bilesenler
 	if len(monorepoRows) > 0 {
 		boxParts = append(boxParts, sep4)
 		boxParts = append(boxParts, monorepoRows...)

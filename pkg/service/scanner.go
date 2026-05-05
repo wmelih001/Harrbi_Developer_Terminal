@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -45,15 +46,16 @@ type TechSignature struct {
 
 // ProjectCache cache yapısı
 type ProjectCache struct {
-	Version      int              `json:"version"` // Cache versiyonu (yapısal değişiklikler için)
-	Projects     []domain.Project `json:"projects"`
-	Timestamp    int64            `json:"timestamp"`
-	RootPath     string           `json:"root_path"`
-	RootModTimes map[string]int64 `json:"root_mod_times"`
+	Version          int               `json:"version"` // Cache versiyonu (yapısal değişiklikler için)
+	Projects         []domain.Project  `json:"projects"`
+	Timestamp        int64             `json:"timestamp"`
+	RootPath         string            `json:"root_path"`
+	RootModTimes     map[string]int64  `json:"root_mod_times"`
+	FileFingerprints map[string]string `json:"file_fingerprints"`
 }
 
 const (
-	CurrentCacheVersion = 4 // Versiyon 4: Monorepo root script önceliği eklendi
+	CurrentCacheVersion = 11 // Versiyon 11: Kritik dosya fingerprint cache invalidation eklendi
 	cacheFileName       = ".devterminal_cache.json"
 )
 
@@ -85,27 +87,23 @@ func (s *Scanner) loadCache(rootPath string) ([]domain.Project, bool) {
 		return nil, false
 	}
 
-	// Klasör modification time kontrolü ile akıllı invalidation
-	// Eğer projelerin bulunduğu ana klasörde değişiklik varsa (yeni proje eklendi/silindi vb.)
-	// cache geçersiz sayılmalı.
-	if len(cache.RootModTimes) == 0 {
-		return nil, false // Eski format cache ise yenile
+	if cache.FileFingerprints == nil {
+		return nil, false
+	}
+	if !fingerprintsEqual(cache.FileFingerprints, criticalFileFingerprints(s.Config.ProjectsPaths)) {
+		return nil, false
 	}
 
-	for _, path := range s.Config.ProjectsPaths {
-		if info, err := os.Stat(path); err == nil {
-			currentModTime := info.ModTime().Unix()
-			if cachedTime, ok := cache.RootModTimes[path]; !ok || cachedTime != currentModTime {
-				return nil, false // Değişiklik var, yeniden tara
+	if len(cache.RootModTimes) > 0 {
+		for _, path := range s.Config.ProjectsPaths {
+			if info, err := os.Stat(path); err == nil {
+				currentModTime := info.ModTime().Unix()
+				if cachedTime, ok := cache.RootModTimes[path]; !ok || cachedTime != currentModTime {
+					if !fingerprintsEqual(cache.FileFingerprints, criticalFileFingerprints(s.Config.ProjectsPaths)) {
+						return nil, false
+					}
+				}
 			}
-		}
-	}
-
-	// 3. Proje bazlı detaylı validasyon
-	// Cache'deki her projenin klasör modification time'ını kontrol et
-	for _, p := range cache.Projects {
-		if info, err := os.Stat(p.Path); err != nil || info.ModTime().Unix() > cache.Timestamp {
-			return nil, false // Bir proje değişmiş, yeniden tara
 		}
 	}
 
@@ -129,15 +127,115 @@ func (s *Scanner) saveCache(rootPath string, projects []domain.Project) {
 	}
 
 	cache := ProjectCache{
-		Version:      CurrentCacheVersion,
-		Projects:     projects,
-		Timestamp:    time.Now().Unix(),
-		RootPath:     rootPath,
-		RootModTimes: modTimes,
+		Version:          CurrentCacheVersion,
+		Projects:         projects,
+		Timestamp:        time.Now().Unix(),
+		RootPath:         rootPath,
+		RootModTimes:     modTimes,
+		FileFingerprints: criticalFileFingerprints(s.Config.ProjectsPaths),
 	}
 
 	data, _ := json.Marshal(cache)
 	_ = os.WriteFile(cachePath, data, 0644)
+}
+
+func criticalFileFingerprints(rootPaths []string) map[string]string {
+	fingerprints := make(map[string]string)
+	for _, rootPath := range rootPaths {
+		_ = filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+
+			name := d.Name()
+			if d.IsDir() {
+				if path != rootPath && shouldSkipFingerprintDir(name) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			if !isCriticalCacheFile(name) {
+				return nil
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			rel, err := filepath.Rel(rootPath, path)
+			if err != nil {
+				rel = path
+			}
+			key := filepath.Clean(rel)
+			if len(rootPaths) > 1 {
+				key = filepath.Clean(rootPath) + string(os.PathSeparator) + key
+			}
+			sum := sha256.Sum256(append([]byte(key), data...))
+			fingerprints[key] = fmt.Sprintf("%x", sum[:])
+			return nil
+		})
+	}
+	return fingerprints
+}
+
+func shouldSkipFingerprintDir(name string) bool {
+	switch strings.ToLower(name) {
+	case ".git", "node_modules", "vendor", "dist", "build", ".next", ".turbo", ".cache", "coverage":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCriticalCacheFile(name string) bool {
+	lower := strings.ToLower(name)
+	switch lower {
+	case "package.json",
+		"go.mod",
+		"go.sum",
+		"requirements.txt",
+		"pyproject.toml",
+		"poetry.lock",
+		"pubspec.yaml",
+		"pubspec.lock",
+		"composer.json",
+		"composer.lock",
+		"cargo.toml",
+		"cargo.lock",
+		"package-lock.json",
+		"npm-shrinkwrap.json",
+		"pnpm-lock.yaml",
+		"pnpm-workspace.yaml",
+		"yarn.lock",
+		"bun.lock",
+		"bun.lockb",
+		"turbo.json",
+		"nx.json",
+		"lerna.json",
+		".env.example",
+		".env.sample",
+		".env.template",
+		"docker-compose.yml",
+		"docker-compose.yaml",
+		"compose.yml",
+		"compose.yaml":
+		return true
+	default:
+		return false
+	}
+}
+
+func fingerprintsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 // Klasör adı bazlı ipuçları
@@ -759,7 +857,7 @@ func getDockerBaseImage(path string) string {
 func (s *Scanner) calculateHealthScore(projectPath string, p *domain.Project) {
 	// Use the unified HealthService to avoid inconsistencies
 	hs := NewHealthService()
-	report := hs.CheckHealth(projectPath)
+	report := hs.CheckProjectHealth(*p)
 
 	p.HealthScore = report.Score
 	p.HealthDetails = report.PassedItems
@@ -965,7 +1063,7 @@ func (s *Scanner) scanMonorepo(projectPath string, p *domain.Project) {
 			p.HasFrontend = true
 			p.FrontendType = first.Type
 			p.FrontendVer = first.Version
-			p.FrontendPath = first.Path
+			p.FrontendPath = subProjectWorkDir(first)
 			p.FrontendCmd = first.StartCmd
 		}
 		if len(p.AllBackends) > 0 && !p.HasBackend {
@@ -973,10 +1071,11 @@ func (s *Scanner) scanMonorepo(projectPath string, p *domain.Project) {
 			p.HasBackend = true
 			p.BackendType = first.Type
 			p.BackendVer = first.Version
-			p.BackendPath = first.Path
+			p.BackendPath = subProjectWorkDir(first)
 			p.BackendCmd = first.StartCmd
 		}
 	}
+	syncProjectComponents(p)
 }
 
 func (s *Scanner) detectMonorepoSubProject(subName, subPath string, sigs []TechSignature, isFrontend bool) (domain.SubProject, bool) {
@@ -996,12 +1095,21 @@ func (s *Scanner) detectMonorepoSubProject(subName, subPath string, sigs []TechS
 }
 
 func (s *Scanner) applyMonorepoRootScript(rootPath string, subProject *domain.SubProject) {
-	scriptName := s.findMonorepoRootScript(rootPath, subProject.Name, subProject.IsFrontend)
-	if scriptName == "" {
+	role := domain.ComponentRoleBackend
+	if subProject.IsFrontend {
+		role = domain.ComponentRoleFrontend
+	}
+	plan := NewCommandResolver().ResolveStartCommand(CommandResolveRequest{
+		RootPath:      rootPath,
+		ComponentName: subProject.Name,
+		ComponentPath: subProject.Path,
+		Role:          role,
+	})
+	if plan.Command == "" {
 		return
 	}
-	subProject.Path = rootPath
-	subProject.StartCmd = packageManagerRunScriptCommand(rootPath, scriptName)
+	subProject.WorkDir = plan.Cwd
+	subProject.StartCmd = plan.Command
 }
 
 func (s *Scanner) findMonorepoRootScript(rootPath, subName string, isFrontend bool) string {
@@ -1110,6 +1218,110 @@ func nonEmptyVersion(version string) string {
 	return version
 }
 
+func syncProjectComponents(p *domain.Project) {
+	p.Components = nil
+
+	addComponent := func(sub domain.SubProject, role domain.ComponentRole, isPrimary bool) {
+		analysis := analyzeComponentRole(sub.Path, sub.Name, role)
+		if analysis.Role != domain.ComponentRoleUnknown {
+			role = analysis.Role
+		}
+		confidence := analysis.Confidence
+		if confidence == 0 {
+			confidence = 70
+		}
+		evidence := analysis.Evidence
+		if len(evidence) == 0 {
+			evidence = []domain.ComponentEvidence{
+				{
+					Kind:   "scanner",
+					Source: sub.Path,
+					Detail: string(role) + " component",
+					Score:  confidence,
+				},
+			}
+		}
+		envWarnings := componentEnvWarnings(p.Path, sub.Path, role)
+
+		p.Components = append(p.Components, domain.ProjectComponent{
+			Name:        sub.Name,
+			Path:        sub.Path,
+			Role:        role,
+			Type:        sub.Type,
+			Version:     sub.Version,
+			StartCmd:    sub.StartCmd,
+			WorkDir:     subProjectWorkDir(sub),
+			IsPrimary:   isPrimary,
+			Confidence:  confidence,
+			Evidence:    evidence,
+			EnvWarnings: envWarnings,
+		})
+	}
+
+	for i, sub := range p.AllFrontends {
+		addComponent(sub, domain.ComponentRoleFrontend, i == 0)
+	}
+	for i, sub := range p.AllBackends {
+		addComponent(sub, domain.ComponentRoleBackend, i == 0)
+	}
+
+	if len(p.Components) > 0 {
+		return
+	}
+
+	if p.HasFrontend {
+		addComponent(domain.SubProject{
+			Name:       componentName(p.Name, p.FrontendPath, "frontend"),
+			Path:       p.FrontendPath,
+			WorkDir:    p.FrontendPath,
+			Type:       p.FrontendType,
+			Version:    nonEmptyVersion(p.FrontendVer),
+			StartCmd:   p.FrontendCmd,
+			IsFrontend: true,
+		}, domain.ComponentRoleFrontend, true)
+	}
+	if p.HasBackend {
+		addComponent(domain.SubProject{
+			Name:     componentName(p.Name, p.BackendPath, "backend"),
+			Path:     p.BackendPath,
+			WorkDir:  p.BackendPath,
+			Type:     p.BackendType,
+			Version:  nonEmptyVersion(p.BackendVer),
+			StartCmd: p.BackendCmd,
+		}, domain.ComponentRoleBackend, true)
+	}
+}
+
+func subProjectWorkDir(sub domain.SubProject) string {
+	if sub.WorkDir != "" {
+		return sub.WorkDir
+	}
+	return sub.Path
+}
+
+func componentEnvWarnings(rootPath, componentPath string, role domain.ComponentRole) []string {
+	if role != domain.ComponentRoleBackend {
+		return nil
+	}
+	report := NewEnvResolver().Resolve(rootPath, componentPath)
+	var warnings []string
+	for _, req := range report.Missing {
+		warnings = append(warnings, req.Name+" eksik")
+	}
+	return warnings
+}
+
+func componentName(projectName, componentPath, fallback string) string {
+	if componentPath == "" {
+		return fallback
+	}
+	name := filepath.Base(componentPath)
+	if name == "." || name == string(os.PathSeparator) || name == projectName {
+		return fallback
+	}
+	return name
+}
+
 func (s *Scanner) ScanProjects() []domain.Project {
 	// Cache Key: Proje yollarının birleşimi
 	cacheKey := strings.Join(s.Config.ProjectsPaths, "|")
@@ -1122,6 +1334,7 @@ func (s *Scanner) ScanProjects() []domain.Project {
 			s.checkTools(projects[i].Path, &projects[i])
 			// Scriptleri her zaman taze tut
 			projects[i].Scripts = s.scanPackageScripts(&projects[i])
+			syncProjectComponents(&projects[i])
 		}
 
 		// Cache'den gelen projeler için de config senkronizasyonu yap
@@ -1537,6 +1750,7 @@ func (s *Scanner) scanDirectory(root string) []domain.Project {
 		// ADIM 5: Tip Belirleme
 		// ========================================
 		s.determineProjectType(&p)
+		syncProjectComponents(&p)
 
 		// ========================================
 		// ADIM 6: Sadece proje olarak algılananları ekle
@@ -1556,7 +1770,7 @@ func (s *Scanner) scanDirectory(root string) []domain.Project {
 			// s.manageProjectConfig(&p) kaldırıldı.
 
 			// Port kontrolü yap
-			portInfos := CheckProjectPorts(p.HasFrontend, p.HasBackend)
+			portInfos := CheckProjectPortsForProject(p, "full")
 			for _, info := range portInfos {
 				p.PortWarnings = append(p.PortWarnings, FormatPortWarning(info))
 			}
@@ -1855,111 +2069,21 @@ func (s *Scanner) detectStartCommand(path string, isFrontend, isBackend bool) st
 	// 1. JS/TS Projects (Next, Nest, React, Vue, etc.)
 	pkgPath := filepath.Join(path, "package.json")
 	if _, err := os.Stat(pkgPath); err == nil {
-		data, err := os.ReadFile(pkgPath)
-		if err == nil {
-			var pkg packageJSON
-			if err := json.Unmarshal(data, &pkg); err == nil {
-				// Akıllı Script Analizi (Score-Based)
-				bestScript := ""
-				maxScore := -9999
-				folderName := strings.ToLower(filepath.Base(path))
-
-				for scriptName, scriptContent := range pkg.Scripts {
-					score := 0
-					lowerName := strings.ToLower(scriptName)
-					lowerContent := strings.ToLower(scriptContent)
-
-					// --- Filtreleme (Negatif Puanlar) ---
-					if strings.Contains(lowerName, "test") ||
-						strings.Contains(lowerName, "lint") ||
-						strings.Contains(lowerName, "build") ||
-						strings.Contains(lowerName, "type-check") ||
-						(strings.Contains(lowerName, "analyze") && !strings.Contains(lowerName, "bundle")) ||
-						strings.Contains(lowerName, "e2e") {
-						score -= 500 // Elenmesi garanti olsun
-					}
-
-					// --- İsim Puanları (Temel) ---
-					// Tam eşleşmeler (En yüksek öncelik)
-					if lowerName == "dev" || lowerName == "develop" || lowerName == "start:dev" {
-						score += 100
-					} else if lowerName == "start" || lowerName == "serve" || lowerName == "watch" {
-						score += 50
-					} else if strings.Contains(lowerName, "dev") { // "web:dev", "app:dev"
-						score += 80
-					} else if strings.Contains(lowerName, "start") {
-						score += 40
-					}
-
-					// --- Yeni: Bağlamsal Puanlama (Context-Aware) ---
-					if isFrontend {
-						// Frontend spesifik kelimeler
-						if lowerName == "web" ||
-							lowerName == "client" ||
-							lowerName == "ui" ||
-							lowerName == "frontend" ||
-							lowerName == "app" ||
-							lowerName == "site" {
-							score += 80
-						}
-						// Context Bonus: Eğer frontend arıyorsak ve script adı frontend ile ilgiliyse
-						if strings.Contains(lowerName, "web") || strings.Contains(lowerName, "client") {
-							score += 100
-						}
-					}
-
-					if isBackend {
-						// Backend spesifik kelimeler
-						if lowerName == "api" ||
-							lowerName == "server" ||
-							lowerName == "backend" ||
-							lowerName == "admin" ||
-							lowerName == "service" {
-							score += 80
-						}
-						// Context Bonus: Eğer backend arıyorsak ve script adı backend ile ilgiliyse
-						if strings.Contains(lowerName, "api") || strings.Contains(lowerName, "server") {
-							score += 100
-						}
-					}
-
-					// --- Yeni: Klasör Eşleşmesi (Smart Matching) ---
-					// Eğer script adı klasör adıyla aynıysa (örn: klasör=web, script=web)
-					// Bu genellikle monorepo'larda "npm run web" şeklinde kullanılır.
-					if lowerName == folderName {
-						score += 200
-					}
-
-					// --- İçerik Puanları ---
-					// Framework spesifik komutlar
-					if strings.Contains(lowerContent, "next dev") ||
-						strings.Contains(lowerContent, "vite") ||
-						strings.Contains(lowerContent, "nuxt dev") ||
-						strings.Contains(lowerContent, "ng serve") ||
-						strings.Contains(lowerContent, "react-scripts start") ||
-						strings.Contains(lowerContent, "astro dev") ||
-						strings.Contains(lowerContent, "remix dev") {
-						score += 50
-					}
-					// Generic development tools
-					if strings.Contains(lowerContent, "nodemon") ||
-						strings.Contains(lowerContent, "ts-node-dev") ||
-						strings.Contains(lowerContent, "nest start") || // NestJS specific
-						strings.Contains(lowerContent, "--watch") {
-						score += 20
-					}
-
-					// En yüksek skoru güncelle
-					if score > maxScore {
-						maxScore = score
-						bestScript = scriptName
-					}
-				}
-
-				if bestScript != "" && maxScore > 0 {
-					return packageManagerRunScriptCommand(path, bestScript)
-				}
-			}
+		role := domain.ComponentRoleUnknown
+		if isFrontend {
+			role = domain.ComponentRoleFrontend
+		}
+		if isBackend {
+			role = domain.ComponentRoleBackend
+		}
+		plan := NewCommandResolver().ResolveStartCommand(CommandResolveRequest{
+			RootPath:      path,
+			ComponentName: filepath.Base(path),
+			ComponentPath: path,
+			Role:          role,
+		})
+		if plan.Command != "" {
+			return plan.Command
 		}
 	}
 

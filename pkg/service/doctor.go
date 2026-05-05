@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"devterminal/pkg/domain"
@@ -29,6 +30,17 @@ type NpmOutdatedResult map[string]struct {
 	Kind    string `json:"kind"` // "direct", "dev"
 }
 
+type DependencyTarget struct {
+	Name           string
+	Label          string
+	Path           string
+	WorkDir        string
+	RootPath       string
+	Role           domain.ComponentRole
+	PackageManager string
+	IsRoot         bool
+}
+
 // CheckDependencies runs package-manager-specific dependency checks in the project path.
 func (d *Doctor) CheckDependencies(p *domain.Project) (NpmOutdatedResult, error) {
 	// 1. Flutter Check
@@ -44,6 +56,120 @@ func (d *Doctor) CheckDependencies(p *domain.Project) (NpmOutdatedResult, error)
 	// 2. Node.js Check (Default)
 	targetPath := d.nodeDependencyPath(p)
 	return d.checkNodeDependencies(targetPath)
+}
+
+func (d *Doctor) DependencyTargets(p *domain.Project) []DependencyTarget {
+	if p == nil {
+		return nil
+	}
+
+	rootManager := detectPackageManagerName(p.Path)
+	var targets []DependencyTarget
+	seen := make(map[string]bool)
+
+	add := func(target DependencyTarget) {
+		if target.Path == "" {
+			return
+		}
+		if _, err := os.Stat(filepath.Join(target.Path, "package.json")); err != nil {
+			return
+		}
+		key := strings.ToLower(filepath.Clean(target.Path))
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if target.RootPath == "" {
+			target.RootPath = p.Path
+		}
+		if target.WorkDir == "" {
+			target.WorkDir = target.Path
+		}
+		if target.PackageManager == "" {
+			target.PackageManager = inheritedPackageManager(rootManager, target.Path)
+		}
+		if target.Label == "" {
+			target.Label = target.Name
+		}
+		targets = append(targets, target)
+	}
+
+	add(DependencyTarget{
+		Name:           "root",
+		Label:          "Root",
+		Path:           p.Path,
+		WorkDir:        p.Path,
+		RootPath:       p.Path,
+		Role:           domain.ComponentRoleUnknown,
+		PackageManager: rootManager,
+		IsRoot:         true,
+	})
+
+	for _, component := range p.Components {
+		add(DependencyTarget{
+			Name:           component.Name,
+			Label:          component.Name,
+			Path:           component.Path,
+			WorkDir:        firstNonEmptyString(component.WorkDir, component.Path),
+			RootPath:       p.Path,
+			Role:           component.Role,
+			PackageManager: inheritedPackageManager(rootManager, component.Path),
+		})
+	}
+
+	if len(p.Components) == 0 {
+		add(DependencyTarget{
+			Name:           "frontend",
+			Label:          "Frontend",
+			Path:           p.FrontendPath,
+			WorkDir:        p.FrontendPath,
+			RootPath:       p.Path,
+			Role:           domain.ComponentRoleFrontend,
+			PackageManager: inheritedPackageManager(rootManager, p.FrontendPath),
+		})
+		add(DependencyTarget{
+			Name:           "backend",
+			Label:          "Backend",
+			Path:           p.BackendPath,
+			WorkDir:        p.BackendPath,
+			RootPath:       p.Path,
+			Role:           domain.ComponentRoleBackend,
+			PackageManager: inheritedPackageManager(rootManager, p.BackendPath),
+		})
+	}
+
+	if len(targets) <= 1 {
+		return targets
+	}
+	sort.SliceStable(targets[1:], func(i, j int) bool {
+		return strings.ToLower(targets[1+i].Name) < strings.ToLower(targets[1+j].Name)
+	})
+	return targets
+}
+
+func inheritedPackageManager(rootManager, path string) string {
+	manager := detectPackageManagerName(path)
+	if manager == packageManagerNpm && rootManager != "" && rootManager != packageManagerNpm {
+		return rootManager
+	}
+	if manager != "" {
+		return manager
+	}
+	return rootManager
+}
+
+func (d *Doctor) CheckTargetDependencies(target DependencyTarget) (NpmOutdatedResult, error) {
+	if target.Path == "" {
+		return nil, fmt.Errorf("dependency target path boş")
+	}
+	if _, err := os.Stat(filepath.Join(target.Path, "pubspec.yaml")); err == nil {
+		return d.checkFlutterDependencies(target.Path)
+	}
+	manager := target.PackageManager
+	if manager == "" {
+		manager = inheritedPackageManager(detectPackageManagerName(target.RootPath), target.Path)
+	}
+	return d.checkNodeDependenciesWithManager(target.Path, manager)
 }
 
 func (d *Doctor) checkFlutterDependencies(path string) (NpmOutdatedResult, error) {
@@ -157,12 +283,15 @@ func (d *Doctor) checkFlutterDependencies(path string) (NpmOutdatedResult, error
 }
 
 func (d *Doctor) checkNodeDependencies(path string) (NpmOutdatedResult, error) {
+	return d.checkNodeDependenciesWithManager(path, detectPackageManagerName(path))
+}
+
+func (d *Doctor) checkNodeDependenciesWithManager(path, manager string) (NpmOutdatedResult, error) {
 	packageJSONPath := filepath.Join(path, "package.json")
 	if _, err := os.Stat(packageJSONPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("package.json bulunamadı. Bu proje bir Node.js projesi değil")
 	}
 
-	manager := detectPackageManagerName(path)
 	finalRes, err := dependenciesFromPackageJSON(path)
 	if err != nil {
 		return nil, err
@@ -226,6 +355,10 @@ func (d *Doctor) packageManagerOutdatedCmd(manager, path string) *exec.Cmd {
 
 func (d *Doctor) nodeUpdateCommand(path string, pkgs []string) (*exec.Cmd, []string) {
 	manager := detectPackageManagerName(path)
+	return nodeUpdateCommandForManager(path, manager, pkgs)
+}
+
+func nodeUpdateCommandForManager(path, manager string, pkgs []string) (*exec.Cmd, []string) {
 	var args []string
 	var finalPkgs []string
 
@@ -779,6 +912,49 @@ func (d *Doctor) GetUpdateCommands(p *domain.Project, pkgs []string) ([]*exec.Cm
 		}
 	}
 
+	return commands, finalPkgs, nil
+}
+
+func (d *Doctor) GetUpdateCommandsForTarget(target DependencyTarget, pkgs []string) ([]*exec.Cmd, []string, error) {
+	if target.Path == "" {
+		return nil, nil, fmt.Errorf("dependency target path boş")
+	}
+	var commands []*exec.Cmd
+	var finalPkgs []string
+
+	if _, err := os.Stat(filepath.Join(target.Path, "pubspec.yaml")); err == nil {
+		args := []string{"pub", "upgrade", "--major-versions"}
+		args = append(args, pkgs...)
+		cmd := exec.Command("flutter", args...)
+		cmd.Dir = target.Path
+		commands = append(commands, cmd)
+		finalPkgs = append(finalPkgs, pkgs...)
+		return commands, finalPkgs, nil
+	}
+
+	if _, err := os.Stat(filepath.Join(target.Path, "go.mod")); err == nil {
+		args := []string{"get"}
+		if len(pkgs) == 0 {
+			args = []string{"get", "-u", "./..."}
+		} else {
+			for _, pkg := range pkgs {
+				args = append(args, pkg+"@latest")
+				finalPkgs = append(finalPkgs, pkg)
+			}
+		}
+		cmd := exec.Command("go", args...)
+		cmd.Dir = target.Path
+		commands = append(commands, cmd)
+		return commands, finalPkgs, nil
+	}
+
+	manager := target.PackageManager
+	if manager == "" {
+		manager = inheritedPackageManager(detectPackageManagerName(target.RootPath), target.Path)
+	}
+	cmd, updatedPkgs := nodeUpdateCommandForManager(target.Path, manager, pkgs)
+	commands = append(commands, cmd)
+	finalPkgs = append(finalPkgs, updatedPkgs...)
 	return commands, finalPkgs, nil
 }
 
