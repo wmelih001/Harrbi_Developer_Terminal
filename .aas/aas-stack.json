@@ -1,0 +1,71 @@
+{
+  "catalog": {
+    "integrity": "sha256-d1de8654957529b69e33619373ece2a123562825ab4888e6c826b932099e02fc",
+    "package": "agentic-awesome-skills",
+    "version": "17.0.0"
+  },
+  "name": "developer-terminal",
+  "profile": {
+    "constraints": [
+      "Superpowers remains the primary software-development methodology",
+      "Windows-first runtime with Linux and macOS release builds",
+      "No persistent database; only local YAML configuration and JSON cache",
+      "Preserve repository-local instructions and existing user work",
+      "Bootstrap discovery must not install or modify project skills"
+    ],
+    "frameworks": [
+      "Bubble Tea",
+      "Bubbles",
+      "Lipgloss",
+      "Viper",
+      "GoReleaser",
+      "GitHub Actions"
+    ],
+    "goals": [
+      "Maintain the layered TEA architecture and custom project scanning domain",
+      "Harden Windows process launching, command execution, and path handling",
+      "Validate local YAML configuration and JSON cache behavior",
+      "Improve behavior-focused Go tests without duplicating Superpowers TDD",
+      "Audit source and dependencies for command execution and supply-chain risks",
+      "Maintain secure cross-platform GitHub release automation"
+    ],
+    "languages": [
+      "Go",
+      "YAML"
+    ],
+    "projectType": "Windows-first cross-platform Go terminal UI developer tool"
+  },
+  "schemaVersion": 2,
+  "skills": [
+    {
+      "id": "architecture"
+    },
+    {
+      "id": "go"
+    },
+    {
+      "id": "windows-shell-reliability"
+    },
+    {
+      "id": "deployment-validation-config-validate"
+    },
+    {
+      "id": "test-guard"
+    },
+    {
+      "id": "code-audit"
+    },
+    {
+      "id": "security-scanning-security-dependencies"
+    },
+    {
+      "id": "github-actions-advanced"
+    }
+  ],
+  "targets": [
+    {
+      "host": "codex",
+      "scope": "project"
+    }
+  ]
+}
